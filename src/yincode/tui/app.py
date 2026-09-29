@@ -13,6 +13,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer
 from textual.message import Message
+from textual.screen import Screen
 from textual.timer import Timer
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
@@ -36,15 +37,21 @@ class SessionState(Enum):
 class MessageInput(TextArea):
     """Enter 发消息，Alt+Enter 插入换行。"""
 
-    BINDINGS = [
-        Binding("enter", "submit_message", "发送", show=False, priority=True),
-        Binding("alt+enter", "insert_newline", "换行", show=False, priority=True),
-    ]
-
     class Submitted(Message):
         def __init__(self, text: str) -> None:
             super().__init__()
             self.text = text
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key not in ("enter", "alt+enter"):
+            return
+        # 字符与控制键必须在同一组件队列处理，避免优先绑定抢先读取旧正文。
+        event.stop()
+        event.prevent_default()
+        if event.key == "enter":
+            self.action_submit_message()
+        else:
+            self.action_insert_newline()
 
     def action_submit_message(self) -> None:
         self.post_message(self.Submitted(self.text))
@@ -95,6 +102,7 @@ class YinCodeApp(App[None]):
         self.turn_start = 0.0
         self._stream_task: asyncio.Task[None] | None = None
         self._timer: Timer | None = None
+        self._pending_stream_follow: float | None = None
         self.transcript: list[RenderableType] = []
         self._resources_closing = False
         self._resources_closed = False
@@ -111,6 +119,9 @@ class YinCodeApp(App[None]):
         yield Static("", id="statusbar", markup=False)
 
     def on_mount(self) -> None:
+        self.screen.screen_layout_refresh_signal.subscribe(
+            self, self._follow_stream_after_layout, immediate=True
+        )
         self.query_one("#streaming-panel").display = False
         self.transcript.append(Text(render_banner(__version__, str(self.cwd), self.size.width)))
         if len(self.providers) == 1:
@@ -184,19 +195,37 @@ class YinCodeApp(App[None]):
         panel = self.query_one("#streaming-panel", ScrollableContainer)
         was_at_end = panel.is_vertical_scroll_end
         previous_scroll = panel.scroll_y
+        if self._pending_stream_follow != previous_scroll:
+            self._pending_stream_follow = None
+        if follow_output and was_at_end:
+            self._pending_stream_follow = previous_scroll
         streaming = self.query_one("#streaming", Static)
         streaming.update(streaming_block(self.cur_reply, time.monotonic() - self.turn_start))
-        if follow_output and was_at_end:
 
-            def follow_after_layout() -> None:
-                if self.state is not SessionState.STREAMING or self._resources_closing:
-                    return
-                # 新尺寸要等布局完成；等待期间用户滚动时取消这次跟随。
-                if panel.scroll_y == previous_scroll:
-                    panel.scroll_end(animate=False, immediate=True, x_axis=False)
-
-            # 从内容组件队列排在其布局请求之后，避免读到旧虚拟高度。
-            streaming.call_after_refresh(follow_after_layout)
+    def _follow_stream_after_layout(self, screen: Screen) -> None:
+        previous_scroll = self._pending_stream_follow
+        if (
+            previous_scroll is None
+            or self.state is not SessionState.STREAMING
+            or self._resources_closing
+        ):
+            self._pending_stream_follow = None
+            return
+        panel = screen.query_one("#streaming-panel", ScrollableContainer)
+        if panel.scroll_y != previous_scroll:
+            self._pending_stream_follow = None
+            return
+        streaming = screen.query_one("#streaming", Static)
+        size = streaming.content_size
+        # 滚动重排也会发信号；正文高度尚未应用时，继续等它自己的布局。
+        if (
+            not size.width
+            or streaming.get_content_height(panel.size, screen.size, size.width) != size.height
+        ):
+            return
+        # 同高度正文也消费一次，避免意图遗留到之后的普通窗口缩放。
+        self._pending_stream_follow = None
+        panel.scroll_end(animate=False, immediate=True, x_axis=False)
 
     def _finish_with_assistant(self, reply: str) -> None:
         self.conv.add_assistant(reply)
@@ -211,6 +240,7 @@ class YinCodeApp(App[None]):
 
     def _finish_turn(self) -> None:
         self._stop_timer()
+        self._pending_stream_follow = None
         self.state = SessionState.IDLE
         self.cur_reply = ""
         self.query_one("#streaming", Static).update("")
@@ -247,6 +277,7 @@ class YinCodeApp(App[None]):
             if self._resources_closed:
                 return
             self._resources_closing = True
+            self._pending_stream_follow = None
             self._stop_timer()
             task = self._stream_task
             if task is not None:

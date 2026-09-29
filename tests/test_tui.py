@@ -6,7 +6,9 @@ from pathlib import Path
 import pytest
 from rich.console import Console, RenderableType
 from rich.markdown import Markdown
+from textual import events
 from textual.containers import ScrollableContainer
+from textual.geometry import Size
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
 from yincode.config import ProviderConfig
@@ -444,3 +446,126 @@ async def test_user_scroll_cancels_a_follow_waiting_for_layout(tmp_path: Path) -
         panel.scroll_home(animate=False, immediate=True)
         await pilot.pause()
         assert panel.scroll_y == 0
+
+
+def post_rapid_keys(app: YinCodeApp, *keys: str) -> None:
+    """模拟终端单批到达的按键，不在字符之间等待组件处理。"""
+    for key in keys:
+        app.post_message(events.Key(key, key if len(key) == 1 else None))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["last", "末尾字"])
+async def test_rapid_keys_submit_the_complete_text(tmp_path: Path, text: str) -> None:
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        post_rapid_keys(app, *text, "enter")
+        await pilot.pause()
+        assert app.conv.messages() == [Message("user", text)]
+        assert fake.requests == [[Message("user", text)]]
+        assert app.query_one("#input", TextArea).text == ""
+
+
+@pytest.mark.asyncio
+async def test_rapid_exit_keys_quit_without_starting_a_request(tmp_path: Path) -> None:
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        post_rapid_keys(app, *"/exit", "enter")
+        await pilot.pause()
+        assert fake.client_closed == 1
+        assert app.conv.messages() == []
+        assert fake.requests == []
+
+
+@pytest.mark.asyncio
+async def test_rapid_alt_enter_keeps_newline_between_characters(tmp_path: Path) -> None:
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        post_rapid_keys(app, "a", "b", "alt+enter", "c", "d")
+        await pilot.pause()
+        assert app.query_one("#input", TextArea).text == "ab\ncd"
+        assert fake.requests == []
+
+
+@pytest.mark.asyncio
+async def test_rapid_multiline_keys_submit_the_complete_ordered_text(tmp_path: Path) -> None:
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        post_rapid_keys(app, "a", "b", "alt+enter", "c", "d", "enter")
+        await pilot.pause()
+        assert app.conv.messages() == [Message("user", "ab\ncd")]
+        assert fake.requests == [[Message("user", "ab\ncd")]]
+        assert app.query_one("#input", TextArea).text == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix", ["las", "/exi"])
+async def test_rapid_last_character_is_processed_before_enter(tmp_path: Path, prefix: str) -> None:
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        input_widget = app.query_one("#input", TextArea)
+        input_widget.load_text(prefix)
+        input_widget.move_cursor((0, len(prefix)))
+        await pilot.pause()
+        post_rapid_keys(app, "t", "enter")
+        await pilot.pause()
+        if prefix == "/exi":
+            assert fake.client_closed == 1
+            assert fake.requests == []
+            assert app.conv.messages() == []
+        else:
+            assert fake.requests == [[Message("user", "last")]]
+            assert app.conv.messages() == [Message("user", "last")]
+
+
+@pytest.mark.asyncio
+async def test_follow_waits_for_the_actual_virtual_size_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        await app.submit("长回复")
+        await fake.events.put(StreamEvent(text="正文\n" * 100))
+        await pilot.pause()
+        panel = app.query_one("#streaming-panel", ScrollableContainer)
+        assert panel.is_vertical_scroll_end
+        previous_bottom = panel.scroll_y
+        original_layout = app.screen._refresh_layout
+
+        def hold_layout(size: Size | None = None, scroll: bool = False) -> None:
+            pass
+
+        # 控制布局与正文更新分离，让「刷新后回调」先读取旧虚拟尺寸。
+        monkeypatch.setattr(app.screen, "_refresh_layout", hold_layout)
+        await fake.events.put(StreamEvent(text="新增\n" * 30))
+        await pilot.pause()
+        assert app.cur_reply.count("\n") == 130
+        assert panel.max_scroll_y == previous_bottom
+        original_layout()
+        await pilot.pause()
+        assert panel.max_scroll_y > previous_bottom
+        assert panel.is_vertical_scroll_end
+
+
+@pytest.mark.asyncio
+async def test_same_height_increment_does_not_leave_follow_for_window_resize(
+    tmp_path: Path,
+) -> None:
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        await app.submit("长回复")
+        await fake.events.put(StreamEvent(text="正文\n" * 100))
+        await pilot.pause()
+        panel = app.query_one("#streaming-panel", ScrollableContainer)
+        streaming = app.query_one("#streaming", Static)
+        assert panel.is_vertical_scroll_end
+        previous_height = streaming.content_size.height
+        previous_bottom = panel.scroll_y
+        await fake.events.put(StreamEvent(text="尾"))
+        await pilot.pause()
+        assert streaming.content_size.height == previous_height
+        assert panel.scroll_y == previous_bottom
+        await pilot.resize_terminal(80, 18)
+        await pilot.pause()
+        assert panel.max_scroll_y > previous_bottom
+        assert panel.scroll_y == previous_bottom
