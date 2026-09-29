@@ -1,0 +1,55 @@
+"""在界面事件循环中消费流，并在所有结束路径关闭迭代器。"""
+
+import asyncio
+from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING
+
+from yincode.llm import StreamEvent
+
+if TYPE_CHECKING:
+    from .app import YinCodeApp
+
+
+async def consume_stream(app: "YinCodeApp") -> None:
+    iterator: AsyncIterator[StreamEvent] | None = None
+    error: Exception | None = None
+    completed = False
+    try:
+        assert app.provider is not None
+        iterator = app.provider.stream(app.conv.messages())
+        async for event in iterator:
+            if event.err is not None:
+                error = event.err
+                break
+            if event.text:
+                app.cur_reply += event.text
+                app._refresh_streaming_view()
+            if event.done:
+                completed = True
+                break
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        error = exc
+    finally:
+        try:
+            # Protocol 允许普通 AsyncIterator；异步生成器则需显式收尾。
+            close = getattr(iterator, "aclose", None)
+            if close is not None:
+                await close()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error = error or exc
+        finally:
+            if app._stream_task is asyncio.current_task():
+                app._stream_task = None
+
+    if app._resources_closing:
+        return
+    if error is not None:
+        app._finish_with_error(error)
+    elif completed:
+        app._finish_with_assistant(app.cur_reply)
+    else:
+        app._finish_with_error(RuntimeError("响应流提前结束，未收到完成事件，请重试"))

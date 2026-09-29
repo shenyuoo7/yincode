@@ -1,0 +1,55 @@
+[project]
+name = "yincode"
+version = "0.1.0"
+description = "A terminal AI coding assistant"
+requires-python = ">=3.12"
+dependencies = [
+  "textual>=8.2.8",
+  "rich>=13",
+  "anthropic>=1.9.0",
+  "openai>=3.20.0",
+  "pyyaml>=6",
+]
+
+[project.scripts]
+yincode = "yincode.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/yincode"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/yincode/**",
+  "tests/**",
+  "pyproject.toml",
+  "uv.lock",
+  ".gitignore",
+  ".gitattributes",
+  ".yincode/config.yaml.example",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6", "mypy>=1.10", "types-PyYAML>=6", "httpx>=0.27"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+disallow_untyped_defs = true
+warn_unused_ignores = true
