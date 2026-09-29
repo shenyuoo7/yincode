@@ -3,6 +3,7 @@
 import asyncio
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 from typing import cast
@@ -18,20 +19,40 @@ from textual.timer import Timer
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
 from yincode import __version__
+from yincode.agent import Agent, Phase, ToolEvent
 from yincode.config import ProviderConfig, redact
 from yincode.conversation import Conversation
 from yincode.llm import Provider, new_provider
 from yincode.prompt import render_banner_text
+from yincode.tool import Registry, new_default_registry
 
 from .select import provider_options
 from .stream import consume_stream
-from .view import error_block, render_markdown, status_bar, streaming_block, user_block
+from .view import (
+    error_block,
+    render_markdown,
+    status_bar,
+    streaming_block,
+    tool_line,
+    tool_result_summary,
+    tool_streaming_block,
+    user_block,
+)
 
 
 class SessionState(Enum):
     SELECTING = auto()
     IDLE = auto()
     STREAMING = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class ToolDisplay:
+    """按调用 id 保存展示参数，同名工具也能准确配对。"""
+
+    tool_call_id: str
+    name: str
+    args: str
 
 
 class MessageInput(TextArea):
@@ -84,6 +105,7 @@ class YinCodeApp(App[None]):
         *,
         provider_factory: Callable[[ProviderConfig], Provider] | None = None,
         cwd: str | Path | None = None,
+        registry: Registry | None = None,
     ) -> None:
         if not providers:
             raise ValueError("至少需要一个模型配置")
@@ -91,10 +113,16 @@ class YinCodeApp(App[None]):
         self.providers = list(providers)
         self._provider_factory = provider_factory or new_provider
         self.cwd = Path(cwd if cwd is not None else Path.cwd()).resolve()
+        self._tool_registry = (
+            registry if registry is not None else new_default_registry(cwd=self.cwd)
+        )
         self.state = SessionState.SELECTING
         self.provider: Provider | None = None
+        self.agent: Agent | None = None
         self.conv = Conversation()
         self.cur_reply = ""
+        self._cur_tool: ToolDisplay | None = None
+        self._tool_displays: dict[str, ToolDisplay] = {}
         self.turn_start = 0.0
         self._stream_task: asyncio.Task[None] | None = None
         self._timer: Timer | None = None
@@ -136,8 +164,14 @@ class YinCodeApp(App[None]):
     def _select_provider(self, index: int) -> None:
         try:
             self.provider = self._provider_factory(self.providers[index])
+            self.agent = Agent(
+                self.provider,
+                self._tool_registry,
+                redactor=self._redact,
+                secrets=tuple(cfg.api_key for cfg in self.providers),
+            )
         except Exception as error:
-            message = redact(str(error), (cfg.api_key for cfg in self.providers))
+            message = self._redact(str(error))
             self.query_one("#log").display = True
             self._append_history(error_block("模型初始化失败：" + message))
             self.query_one("#statusbar", Static).update("请检查配置或选择其他模型，Ctrl+C 退出")
@@ -181,6 +215,9 @@ class YinCodeApp(App[None]):
         self._timer = self.set_interval(0.1, self._tick)
         self._stream_task = asyncio.create_task(self._consume_stream(), name="yincode-stream")
 
+    def _redact(self, text: str) -> str:
+        return redact(text, (cfg.api_key for cfg in self.providers))
+
     async def _consume_stream(self) -> None:
         await consume_stream(self)
 
@@ -197,7 +234,35 @@ class YinCodeApp(App[None]):
         if follow_output and was_at_end:
             self._pending_stream_follow = previous_scroll
         streaming = self.query_one("#streaming", Static)
-        streaming.update(streaming_block(self.cur_reply, time.monotonic() - self.turn_start))
+        elapsed = time.monotonic() - self.turn_start
+        if self._cur_tool is not None:
+            block = tool_streaming_block(self._cur_tool.name, self._cur_tool.args, elapsed)
+        else:
+            block = streaming_block(self.cur_reply, elapsed)
+        streaming.update(block)
+
+    def _handle_tool_event(self, event: ToolEvent) -> None:
+        if event.phase is Phase.START:
+            if self.cur_reply:
+                self._append_history(render_markdown(self._redact(self.cur_reply)))
+                self.cur_reply = ""
+            display = ToolDisplay(
+                event.tool_call_id, self._redact(event.name), self._redact(event.args)
+            )
+            self._tool_displays[event.tool_call_id] = display
+            self._cur_tool = display
+        else:
+            finished_display = self._tool_displays.pop(event.tool_call_id, None)
+            if finished_display is None:
+                finished_display = ToolDisplay(
+                    event.tool_call_id, self._redact(event.name), self._redact(event.args)
+                )
+            self._append_history(tool_line(finished_display.name, finished_display.args))
+            self._append_history(tool_result_summary(self._redact(event.result), event.is_error))
+            if self._cur_tool is not None and self._cur_tool.tool_call_id == event.tool_call_id:
+                self._cur_tool = None
+        self._pending_stream_follow = None
+        self._refresh_streaming_view(follow_output=True)
 
     def _follow_stream_after_layout(self, screen: Screen) -> None:
         previous_scroll = self._pending_stream_follow
@@ -225,13 +290,13 @@ class YinCodeApp(App[None]):
         panel.scroll_end(animate=False, immediate=True, x_axis=False)
 
     def _finish_with_assistant(self, reply: str) -> None:
-        self.conv.add_assistant(reply)
-        self._append_history(render_markdown(reply, time.monotonic() - self.turn_start))
+        self._append_history(
+            render_markdown(self._redact(reply), time.monotonic() - self.turn_start)
+        )
         self._finish_turn()
 
     def _finish_with_error(self, error: Exception) -> None:
-        message = redact(str(error), (cfg.api_key for cfg in self.providers))
-        self.conv.add_assistant(f"[请求失败：{message}]")
+        message = self._redact(str(error))
         self._append_history(error_block(message, time.monotonic() - self.turn_start))
         self._finish_turn()
 
@@ -240,6 +305,8 @@ class YinCodeApp(App[None]):
         self._pending_stream_follow = None
         self.state = SessionState.IDLE
         self.cur_reply = ""
+        self._cur_tool = None
+        self._tool_displays.clear()
         self.query_one("#streaming", Static).update("")
         self.query_one("#streaming-panel").display = False
         self.query_one("#input", MessageInput).focus()
@@ -293,6 +360,8 @@ class YinCodeApp(App[None]):
                         raise
                 finally:
                     self._stream_task = None
+            self._cur_tool = None
+            self._tool_displays.clear()
             if self.provider is not None:
                 try:
                     await self.provider.aclose()
@@ -300,9 +369,7 @@ class YinCodeApp(App[None]):
                     raise
                 except Exception as error:
                     # 退出后由 CLI 重放，避免关闭失败造成密钥进入 traceback。
-                    self.transcript.append(
-                        error_block(redact(str(error), (cfg.api_key for cfg in self.providers)))
-                    )
+                    self.transcript.append(error_block(self._redact(str(error))))
             self._resources_closed = True
 
     async def action_quit(self) -> None:

@@ -12,7 +12,15 @@ import openai
 import pytest
 
 from yincode.config import ProviderConfig
-from yincode.llm import Message, Provider, StreamEvent, new_provider
+from yincode.llm import (
+    Message,
+    Provider,
+    StreamEvent,
+    ToolCall,
+    ToolDefinition,
+    ToolResult,
+    new_provider,
+)
 from yincode.prompt import SYSTEM_PROMPT
 
 ProtocolName = Literal["anthropic", "openai"]
@@ -171,7 +179,7 @@ async def test_request_contains_history_and_streams_only_body(
     http = httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
     provider = provider_with_http(config(protocol, thinking=thinking), http)
     try:
-        events = [event async for event in provider.stream(HISTORY)]
+        events = [event async for event in provider.stream(HISTORY, [])]
         assert events == [
             StreamEvent(text="你好"),
             StreamEvent(text="世界"),
@@ -182,6 +190,7 @@ async def test_request_contains_history_and_streams_only_body(
         body = json.loads(requests[0].content)
         assert body["model"] == "test-model"
         assert body["stream"] is True
+        assert "tools" not in body
         history = [
             {"role": "user", "content": "我叫小明"},
             {"role": "assistant", "content": "你好"},
@@ -227,7 +236,7 @@ async def test_http_error_is_detached_redacted_and_next_request_can_succeed(
     http = httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
     provider = provider_with_http(config(protocol), http)
     try:
-        events = [event async for event in provider.stream(HISTORY)]
+        events = [event async for event in provider.stream(HISTORY, [])]
         assert len(events) == 1
         error = events[0].err
         assert error is not None
@@ -237,7 +246,7 @@ async def test_http_error_is_detached_redacted_and_next_request_can_succeed(
         assert error.__context__ is None
         assert error.__traceback__ is None
         assert requests == 1
-        assert [event async for event in provider.stream(HISTORY)][-1] == StreamEvent(done=True)
+        assert [event async for event in provider.stream(HISTORY, [])][-1] == StreamEvent(done=True)
         assert requests == 2
     finally:
         await provider.aclose()
@@ -257,7 +266,7 @@ async def test_stream_error_closes_response_and_emits_one_redacted_error(
     )
     provider = provider_with_http(config(protocol), http)
     try:
-        events = [event async for event in provider.stream(HISTORY)]
+        events = [event async for event in provider.stream(HISTORY, [])]
         assert events[0] == StreamEvent(text="你好")
         assert len(events) == 2
         assert events[1].err is not None
@@ -285,7 +294,7 @@ async def test_cancellation_propagates_without_terminal_event_and_closes_respons
     events: list[StreamEvent] = []
 
     async def consume() -> None:
-        async for event in provider.stream(HISTORY):
+        async for event in provider.stream(HISTORY, []):
             events.append(event)
 
     task = asyncio.create_task(consume())
@@ -314,7 +323,7 @@ async def test_closing_iterator_early_closes_response(protocol: ProtocolName) ->
         )
     )
     provider = provider_with_http(config(protocol), http)
-    iterator = provider.stream(HISTORY)
+    iterator = provider.stream(HISTORY, [])
     try:
         assert await anext(iterator) == StreamEvent(text="你好")
         await iterator.aclose()  # type: ignore[attr-defined]
@@ -334,7 +343,7 @@ async def test_provider_close_releases_active_response_and_client(protocol: Prot
         )
     )
     provider = provider_with_http(config(protocol), http)
-    iterator = provider.stream(HISTORY)
+    iterator = provider.stream(HISTORY, [])
     try:
         assert await anext(iterator) == StreamEvent(text="你好")
         await provider.aclose()
@@ -378,7 +387,7 @@ async def test_clean_eof_without_protocol_completion_is_an_error(protocol: Proto
     )
     provider = provider_with_http(config(protocol), http)
     try:
-        events = [event async for event in provider.stream(HISTORY)]
+        events = [event async for event in provider.stream(HISTORY, [])]
         assert events[0] == StreamEvent(text="你好")
         assert len(events) == 2
         assert events[1].err is not None
@@ -446,7 +455,7 @@ async def test_owned_client_sends_only_config_identity_and_no_ambient_headers(
     await client._client.aclose()
     client._client = httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
     try:
-        assert [event async for event in provider.stream(HISTORY)][-1] == StreamEvent(done=True)
+        assert [event async for event in provider.stream(HISTORY, [])][-1] == StreamEvent(done=True)
         assert len(requests) == 1
         headers = requests[0].headers
         assert "x-ambient" not in headers
@@ -481,7 +490,544 @@ async def test_explicitly_injected_client_keeps_deliberate_headers(
     http = httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
     provider = provider_with_http(config(protocol), http)
     try:
-        assert [event async for event in provider.stream(HISTORY)][-1] == StreamEvent(done=True)
+        assert [event async for event in provider.stream(HISTORY, [])][-1] == StreamEvent(done=True)
         assert requests[0].headers["x-injected"] == "kept"
+    finally:
+        await provider.aclose()
+
+
+TOOLS = [
+    ToolDefinition(
+        "read_file", "读取文本", {"type": "object", "properties": {"path": {"type": "string"}}}
+    ),
+    ToolDefinition("glob", "查找文件", {"type": "object", "properties": {}}),
+]
+
+
+def openai_tool_chunk(delta: dict[str, object], finish: str | None = None) -> bytes:
+    return sse(
+        {
+            "id": "chat-tools",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "test-model",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+    )
+
+
+def tool_payload(
+    protocol: ProtocolName,
+    *,
+    args: str = '{"path":"示例.txt"}',
+    call_id: str = "call-a",
+    name: str = "read_file",
+    complete: bool = True,
+    second_call: ToolCall | None = None,
+) -> list[bytes]:
+    """正文后发送工具碎片，第二个 HTTP 块可用于测试取消与延后交付。"""
+    if protocol == "openai":
+        start = openai_tool_chunk({"role": "assistant", "content": "正在读取"})
+        split = len(args) // 2
+        body = openai_tool_chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": args[:split]},
+                    }
+                ]
+            }
+        ) + openai_tool_chunk(
+            {"tool_calls": [{"index": 0, "function": {"arguments": args[split:]}}]}
+        )
+        if second_call is not None:
+            body += openai_tool_chunk(
+                {
+                    "tool_calls": [
+                        {
+                            "index": 1,
+                            "id": second_call.id,
+                            "type": "function",
+                            "function": {"name": second_call.name, "arguments": second_call.input},
+                        }
+                    ]
+                }
+            )
+        ending = openai_tool_chunk({}, "tool_calls") + b"data: [DONE]\n\n"
+        return [start + body, ending] if complete else [start + body]
+
+    def event(kind: str, **data: object) -> bytes:
+        return sse({"type": kind, **data}, kind)
+
+    start = event(
+        "message_start",
+        message={
+            "id": "msg-tools",
+            "type": "message",
+            "role": "assistant",
+            "model": "test-model",
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": 4, "output_tokens": 0},
+        },
+    )
+    start += event("content_block_start", index=0, content_block={"type": "text", "text": ""})
+    start += event("content_block_delta", index=0, delta={"type": "text_delta", "text": "正在读取"})
+    start += event("content_block_stop", index=0)
+    start += event(
+        "content_block_start",
+        index=1,
+        content_block={"type": "tool_use", "id": call_id, "name": name, "input": {}},
+    )
+    split = len(args) // 2
+    for part in [args[:split], args[split:]]:
+        start += event(
+            "content_block_delta", index=1, delta={"type": "input_json_delta", "partial_json": part}
+        )
+    ending = event("content_block_stop", index=1)
+    if second_call is not None:
+        ending += event(
+            "content_block_start",
+            index=2,
+            content_block={
+                "type": "tool_use",
+                "id": second_call.id,
+                "name": second_call.name,
+                "input": {},
+            },
+        )
+        if second_call.input:
+            ending += event(
+                "content_block_delta",
+                index=2,
+                delta={
+                    "type": "input_json_delta",
+                    "partial_json": second_call.input,
+                },
+            )
+        ending += event("content_block_stop", index=2)
+    ending += event(
+        "message_delta",
+        delta={"stop_reason": "tool_use", "stop_sequence": None},
+        usage={"output_tokens": 4},
+    )
+    ending += event("message_stop")
+    return [start, ending] if complete else [start]
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+async def test_tool_definitions_and_complete_fragmented_call(protocol: ProtocolName) -> None:
+    requests: list[httpx2.Request] = []
+    response = ResponseStream(tool_payload(protocol))
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, stream=response)
+
+    provider = provider_with_http(
+        config(protocol, thinking=True), httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
+    )
+    try:
+        events = [event async for event in provider.stream([Message("user", "读文件")], TOOLS)]
+        assert events[0] == StreamEvent(text="正在读取")
+        assert len(events) == 3
+        assert events[1].tool_calls[0].id == "call-a"
+        assert events[1].tool_calls[0].name == "read_file"
+        assert json.loads(events[1].tool_calls[0].input) == {"path": "示例.txt"}
+        assert events[-1] == StreamEvent(done=True)
+        assert response.closed
+        body = json.loads(requests[0].content)
+        assert "thinking" not in body
+        if protocol == "anthropic":
+            assert body["tools"] == [
+                {
+                    "name": "read_file",
+                    "description": "读取文本",
+                    "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+                },
+                {
+                    "name": "glob",
+                    "description": "查找文件",
+                    "input_schema": {"type": "object", "properties": {}},
+                },
+            ]
+        else:
+            assert body["tools"] == [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "读取文本",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "glob",
+                        "description": "查找文件",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+            ]
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+@pytest.mark.parametrize("preamble", ["", "先读取文件"])
+async def test_tool_history_is_mapped_for_followup_with_thinking_disabled(
+    protocol: ProtocolName, preamble: str
+) -> None:
+    requests: list[httpx2.Request] = []
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=ResponseStream(payload(protocol)),
+        )
+
+    history = [
+        Message("user", "读文件"),
+        Message(
+            "assistant",
+            preamble,
+            tool_calls=[
+                ToolCall("call-a", "read_file", '{"path":"a.txt"}'),
+                ToolCall("call-b", "glob", "{}"),
+            ],
+        ),
+        Message(
+            "tool",
+            tool_results=[ToolResult("call-a", "1 内容"), ToolResult("call-b", "读取失败", True)],
+        ),
+    ]
+    provider = provider_with_http(
+        config(protocol, thinking=True), httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
+    )
+    try:
+        assert [event async for event in provider.stream(history, [])][-1] == StreamEvent(done=True)
+        body = json.loads(requests[0].content)
+        assert "tools" not in body
+        assert "thinking" not in body
+        if protocol == "anthropic":
+            blocks = body["messages"][1]["content"]
+            expected = [
+                {
+                    "type": "tool_use",
+                    "id": "call-a",
+                    "name": "read_file",
+                    "input": {"path": "a.txt"},
+                },
+                {"type": "tool_use", "id": "call-b", "name": "glob", "input": {}},
+            ]
+            assert (
+                blocks == ([{"type": "text", "text": "先读取文件"}] if preamble else []) + expected
+            )
+            assert body["messages"][2] == {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call-a",
+                        "content": "1 内容",
+                        "is_error": False,
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call-b",
+                        "content": "读取失败",
+                        "is_error": True,
+                    },
+                ],
+            }
+            assert len(body["messages"]) == 3
+        else:
+            assert body["messages"][2] == {
+                "role": "assistant",
+                "content": preamble or None,
+                "tool_calls": [
+                    {
+                        "id": "call-a",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path":"a.txt"}'},
+                    },
+                    {
+                        "id": "call-b",
+                        "type": "function",
+                        "function": {"name": "glob", "arguments": "{}"},
+                    },
+                ],
+            }
+            assert body["messages"][3:] == [
+                {"role": "tool", "tool_call_id": "call-a", "content": "1 内容"},
+                {"role": "tool", "tool_call_id": "call-b", "content": "读取失败"},
+            ]
+    finally:
+        await provider.aclose()
+
+
+async def test_openai_interleaved_id_name_arguments_fragments_are_sorted_by_index() -> None:
+    chunks = [
+        openai_tool_chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 1,
+                        "id": "call-",
+                        "type": "function",
+                        "function": {"name": "gl", "arguments": ""},
+                    },
+                    {
+                        "index": 0,
+                        "id": "call-",
+                        "type": "function",
+                        "function": {"name": "read_", "arguments": '{"path":'},
+                    },
+                ]
+            }
+        ),
+        openai_tool_chunk(
+            {
+                "tool_calls": [
+                    {"index": 0, "id": "a", "function": {"name": "file", "arguments": '"a.txt"}'}},
+                    {"index": 1, "id": "b", "function": {"name": "ob", "arguments": ""}},
+                ]
+            }
+        )
+        + openai_tool_chunk({}, "tool_calls")
+        + b"data: [DONE]\n\n",
+    ]
+    response = ResponseStream(chunks)
+    http = httpx2.AsyncClient(
+        transport=httpx2.MockTransport(
+            lambda request: httpx2.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=response
+            )
+        )
+    )
+    provider = provider_with_http(config("openai"), http)
+    try:
+        assert [event async for event in provider.stream(HISTORY, TOOLS)] == [
+            StreamEvent(
+                tool_calls=[
+                    ToolCall("call-a", "read_file", '{"path":"a.txt"}'),
+                    ToolCall("call-b", "glob", "{}"),
+                ]
+            ),
+            StreamEvent(done=True),
+        ]
+        assert response.closed
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+@pytest.mark.parametrize(
+    "args",
+    ['{"path":"unfinished"', '["array"]', "null", " {invalid", '{"value": NaN}', '{"value":1e999}'],
+)
+async def test_invalid_tool_json_is_an_error_without_call_or_done(
+    protocol: ProtocolName, args: str
+) -> None:
+    response = ResponseStream(tool_payload(protocol, args=args))
+    http = httpx2.AsyncClient(
+        transport=httpx2.MockTransport(
+            lambda request: httpx2.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=response
+            )
+        )
+    )
+    provider = provider_with_http(config(protocol), http)
+    try:
+        events = [event async for event in provider.stream(HISTORY, TOOLS)]
+        assert events[0] == StreamEvent(text="正在读取")
+        assert len(events) == 2
+        assert events[-1].err is not None
+        assert not any(event.tool_calls or event.done for event in events)
+        assert response.closed
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+@pytest.mark.parametrize("field", ["call_id", "name"])
+async def test_incomplete_tool_identity_is_rejected(protocol: ProtocolName, field: str) -> None:
+    response = ResponseStream(tool_payload(protocol, **{field: ""}))
+    http = httpx2.AsyncClient(
+        transport=httpx2.MockTransport(
+            lambda request: httpx2.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=response
+            )
+        )
+    )
+    provider = provider_with_http(config(protocol), http)
+    try:
+        events = [event async for event in provider.stream(HISTORY, TOOLS)]
+        assert events[-1].err is not None
+        assert not any(event.tool_calls or event.done for event in events)
+        assert response.closed
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+async def test_tool_call_waits_for_protocol_completion_and_cancellation_closes_response(
+    protocol: ProtocolName,
+) -> None:
+    response = ResponseStream(tool_payload(protocol), block=True)
+    http = httpx2.AsyncClient(
+        transport=httpx2.MockTransport(
+            lambda request: httpx2.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=response
+            )
+        )
+    )
+    provider = provider_with_http(config(protocol), http)
+    events: list[StreamEvent] = []
+
+    async def consume() -> None:
+        async for event in provider.stream(HISTORY, TOOLS):
+            events.append(event)
+
+    task = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(response.waiting.wait(), 5)
+        assert events == [StreamEvent(text="正在读取")]
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert events == [StreamEvent(text="正在读取")]
+        assert response.closed
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await provider.aclose()
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+async def test_valid_tool_arguments_without_terminal_sse_are_rejected(
+    protocol: ProtocolName,
+) -> None:
+    response = ResponseStream(tool_payload(protocol, complete=False))
+    http = httpx2.AsyncClient(
+        transport=httpx2.MockTransport(
+            lambda request: httpx2.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=response
+            )
+        )
+    )
+    provider = provider_with_http(config(protocol), http)
+    try:
+        events = [event async for event in provider.stream(HISTORY, TOOLS)]
+        assert events[-1].err is not None
+        assert not any(event.tool_calls or event.done for event in events)
+        assert response.closed
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.parametrize("finish", ["tool_calls", "length", "content_filter"])
+async def test_openai_empty_or_truncated_tool_turn_does_not_emit_calls(finish: str) -> None:
+    chunks = (
+        [
+            openai_tool_chunk(
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call-a",
+                            "type": "function",
+                            "function": {"name": "glob", "arguments": "{}"},
+                        }
+                    ]
+                }
+            )
+        ]
+        if finish != "tool_calls"
+        else []
+    )
+    chunks.append(openai_tool_chunk({}, finish) + b"data: [DONE]\n\n")
+    response = ResponseStream(chunks)
+    http = httpx2.AsyncClient(
+        transport=httpx2.MockTransport(
+            lambda request: httpx2.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=response
+            )
+        )
+    )
+    provider = provider_with_http(config("openai"), http)
+    try:
+        events = [event async for event in provider.stream(HISTORY, TOOLS)]
+        assert len(events) == 1
+        assert events[0].err is not None
+        assert not any(event.tool_calls or event.done for event in events)
+        assert response.closed
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+@pytest.mark.parametrize("second_id", ["call-a", "call-b"])
+async def test_tool_batches_preserve_same_name_calls_but_reject_duplicate_ids(
+    protocol: ProtocolName,
+    second_id: str,
+) -> None:
+    response = ResponseStream(
+        tool_payload(protocol, second_call=ToolCall(second_id, "read_file", ""))
+    )
+    http = httpx2.AsyncClient(
+        transport=httpx2.MockTransport(
+            lambda request: httpx2.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=response
+            )
+        )
+    )
+    provider = provider_with_http(config(protocol), http)
+    try:
+        events = [event async for event in provider.stream(HISTORY, TOOLS)]
+        if second_id == "call-a":
+            assert events[-1].err is not None
+            assert not any(event.tool_calls or event.done for event in events)
+        else:
+            assert len(events) == 3
+            assert [(call.id, call.name) for call in events[1].tool_calls] == [
+                ("call-a", "read_file"),
+                ("call-b", "read_file"),
+            ]
+            assert json.loads(events[1].tool_calls[1].input) == {}
+            assert events[-1] == StreamEvent(done=True)
+        assert response.closed
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+async def test_invalid_second_call_does_not_emit_first_valid_call(protocol: ProtocolName) -> None:
+    response = ResponseStream(
+        tool_payload(protocol, second_call=ToolCall("call-b", "glob", '{"path":'))
+    )
+    http = httpx2.AsyncClient(
+        transport=httpx2.MockTransport(
+            lambda request: httpx2.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=response
+            )
+        )
+    )
+    provider = provider_with_http(config(protocol), http)
+    try:
+        events = [event async for event in provider.stream(HISTORY, TOOLS)]
+        assert events[-1].err is not None
+        assert not any(event.tool_calls or event.done for event in events)
+        assert response.closed
     finally:
         await provider.aclose()

@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import sys
 from types import SimpleNamespace
@@ -58,7 +59,7 @@ def test_completed_transcript_is_replayed_once_after_ui(monkeypatch, tmp_path, c
     configure_project(monkeypatch, tmp_path)
 
     class CompletedApp:
-        def __init__(self, providers, *, cwd):
+        def __init__(self, providers, *, cwd, registry):
             self.transcript = [Text("YIN snake"), Text("remember 42"), Text("okay 42")]
 
         def run(self):
@@ -76,7 +77,7 @@ def test_constructor_failure_is_redacted_without_traceback(monkeypatch, tmp_path
     configure_project(monkeypatch, tmp_path)
 
     class BrokenApp:
-        def __init__(self, providers, *, cwd):
+        def __init__(self, providers, *, cwd, registry):
             raise RuntimeError("cannot initialize private-value")
 
     monkeypatch.setitem(sys.modules, "yincode.tui", SimpleNamespace(YinCodeApp=BrokenApp))
@@ -87,3 +88,23 @@ def test_constructor_failure_is_redacted_without_traceback(monkeypatch, tmp_path
     assert "private-value" not in output.err
     assert "[REDACTED]" in output.err
     assert "Traceback" not in output.err
+
+
+def test_cli_tool_registry_reads_relative_to_the_project(monkeypatch, tmp_path, capsys):
+    configure_project(monkeypatch, tmp_path)
+    (tmp_path / "sample.txt").write_text("project fixture", encoding="utf-8")
+
+    class ToolApp:
+        def __init__(self, providers, *, cwd, registry):
+            self.registry = registry
+            self.transcript = []
+
+        def run(self):
+            result = asyncio.run(self.registry.execute("read_file", '{"path":"sample.txt"}'))
+            self.transcript.append(Text(result.content))
+
+    monkeypatch.setitem(sys.modules, "yincode.tui", SimpleNamespace(YinCodeApp=ToolApp))
+    cli.main([])
+    output = capsys.readouterr()
+    assert "project fixture" in output.out
+    assert "private-value" not in output.out + output.err

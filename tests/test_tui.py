@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from io import StringIO
 from pathlib import Path
@@ -12,10 +13,17 @@ from textual.geometry import Size
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
 from yincode.config import ProviderConfig
-from yincode.llm import Message, StreamEvent
+from yincode.llm import Message, StreamEvent, ToolCall, ToolDefinition
 from yincode.prompt import render_banner_text
-from yincode.tui import SessionState, YinCodeApp
+from yincode.tui import SessionState, YinCodeApp, view
 from yincode.tui.view import streaming_block
+
+
+def test_crlf_tool_output_has_clean_lines_and_lone_carriage_is_visible():
+    summary = view.tool_result_summary("first\r\nsecond\r\n", False)
+    assert "first\n    second" in summary.plain
+    assert "\\x0d" not in summary.plain
+    assert "\\x0d" in view.tool_result_summary("before\rafter", False).plain
 
 
 class FakeProvider:
@@ -26,13 +34,17 @@ class FakeProvider:
         self.model = cfg.model
         self.events: asyncio.Queue[StreamEvent | Exception | None] = asyncio.Queue()
         self.requests: list[list[Message]] = []
+        self.tool_requests: list[list[ToolDefinition]] = []
         self.stream_closed = 0
         self.client_closed = 0
         self.cancelled = False
         self.close_error: Exception | None = None
 
-    async def stream(self, msgs: list[Message]) -> AsyncIterator[StreamEvent]:
+    async def stream(
+        self, msgs: list[Message], tools: list[ToolDefinition]
+    ) -> AsyncIterator[StreamEvent]:
         self.requests.append(msgs)
+        self.tool_requests.append(tools)
         try:
             while True:
                 event = await self.events.get()
@@ -348,7 +360,9 @@ async def test_cancelling_quit_propagates_instead_of_becoming_a_normal_exit(tmp_
             super().__init__(config)
             self.cleanup_started = asyncio.Event()
 
-        async def stream(self, msgs: list[Message]) -> AsyncIterator[StreamEvent]:
+        async def stream(
+            self, msgs: list[Message], tools: list[ToolDefinition]
+        ) -> AsyncIterator[StreamEvent]:
             self.requests.append(msgs)
             try:
                 await asyncio.Event().wait()
@@ -617,3 +631,315 @@ async def test_rapid_blank_rejection_preserves_following_draft(tmp_path: Path) -
         assert app.conv.messages() == []
         assert fake.requests == []
         assert app.query_one("#input", TextArea).text == " b"
+
+
+@pytest.mark.parametrize(
+    "result", ["\n".join(f"第{i}行" for i in range(20)), "蛇" * 10000], ids=["lines", "bytes"]
+)
+def test_tool_summary_has_eight_line_and_utf8_byte_limits(result: str) -> None:
+    from yincode.tui.view import tool_result_summary
+
+    block = tool_result_summary(result, False)
+    text = block.plain
+    assert len(text.splitlines()) <= 8
+    assert len(text.encode("utf-8")) <= 4096
+    assert "[truncated]" in text
+    assert "�" not in text
+
+
+class WaitingTool:
+    """执行真实异步等待，让 Pilot 验证界面仍消费输入与刷新。"""
+
+    name = "read_file"
+    description = "读取内存夹具"
+    parameters = {"type": "object", "properties": {"path": {"type": "string"}}}
+
+    def __init__(self, result: str | None = None, is_error: bool = False) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cleaned = False
+        self.result = result
+        self.is_error = is_error
+
+    async def execute(self, args: str):
+        from yincode.tool import Result
+
+        self.started.set()
+        try:
+            await self.release.wait()
+            return Result(self.result or f"已读取 {json.loads(args)['path']}", self.is_error)
+        finally:
+            self.cleaned = True
+
+
+@pytest.mark.asyncio
+async def test_slow_tool_keeps_input_and_running_timer_responsive(tmp_path: Path) -> None:
+    from yincode.tool import Registry
+
+    tool = WaitingTool()
+    registry = Registry()
+    registry.register(tool)
+    fake = FakeProvider(cfg())
+    app = YinCodeApp([cfg()], provider_factory=lambda _: fake, cwd=tmp_path, registry=registry)
+    async with app.run_test() as pilot:
+        await app.submit("读取")
+        await fake.events.put(
+            StreamEvent(tool_calls=[ToolCall("read-1", "read_file", '{"path":"first.txt"}')])
+        )
+        await fake.events.put(StreamEvent(done=True))
+        await asyncio.wait_for(tool.started.wait(), 2)
+        await pilot.pause()
+        first = static_text(app, "#streaming")
+        assert "read_file" in first and "first.txt" in first and "Running… (0s)" in first
+        app.turn_start -= 2
+        await pilot.press("草", "稿", "enter", "续")
+        await pilot.pause(0.2)
+        assert "Running… (2s)" in static_text(app, "#streaming")
+        assert app.query_one("#input", TextArea).text == "草稿续"
+        assert len(fake.requests) == 1
+        tool.release.set()
+        await fake.events.put(StreamEvent(text="最终答复"))
+        await fake.events.put(StreamEvent(done=True))
+        await wait_for_state(app, SessionState.IDLE)
+        assert app.query_one("#input", TextArea).text == "草稿续"
+        assert app._cur_tool is None
+        assert tool.cleaned
+
+
+@pytest.mark.asyncio
+async def test_two_same_named_tools_replay_preamble_results_then_final_once(tmp_path: Path) -> None:
+    from yincode.tool import Registry
+
+    tool = WaitingTool()
+    tool.release.set()
+    registry = Registry()
+    registry.register(tool)
+    fake = FakeProvider(cfg())
+    app = YinCodeApp([cfg()], provider_factory=lambda _: fake, cwd=tmp_path, registry=registry)
+    async with app.run_test():
+        await app.submit("读两个文件")
+        for event in (
+            StreamEvent(text="先读取两个文件"),
+            StreamEvent(
+                tool_calls=[
+                    ToolCall("read-a", "read_file", '{"path":"first.txt"}'),
+                    ToolCall("read-b", "read_file", '{"path":"second.txt"}'),
+                ]
+            ),
+            StreamEvent(done=True),
+            StreamEvent(text="最终总结"),
+            StreamEvent(done=True),
+        ):
+            await fake.events.put(event)
+        await wait_for_state(app, SessionState.IDLE)
+        output = render(app.transcript)
+        first_row = output.index("read_file(")
+        second_row = output.index("read_file(", first_row + 1)
+        assert output.index("先读取两个文件") < first_row < output.index("已读取 first.txt")
+        assert output.index("已读取 first.txt") < second_row
+        assert output.index("已读取 second.txt") < output.index("最终总结")
+        assert output.count("耗时：") == 1
+        assert output.count("最终总结") == 1
+        assert [message.role for message in app.conv.messages()] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+        ]
+        assert [result.tool_call_id for result in app.conv.messages()[2].tool_results] == [
+            "read-a",
+            "read-b",
+        ]
+    assert "已读取 first.txt" in render(app.transcript)
+    assert "已读取 second.txt" in render(app.transcript)
+
+
+@pytest.mark.asyncio
+async def test_secret_split_across_text_deltas_is_hidden_in_dynamic_and_history(
+    tmp_path: Path,
+) -> None:
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        await app.submit("密钥保护")
+        await fake.events.put(StreamEvent(text="回复 unit-test-"))
+        await fake.events.put(StreamEvent(text="secret"))
+        await pilot.pause()
+        assert "unit-test-secret" not in static_text(app, "#streaming")
+        assert "[REDACTED]" in static_text(app, "#streaming")
+        await fake.events.put(StreamEvent(done=True))
+        await wait_for_state(app, SessionState.IDLE)
+        assert "unit-test-secret" not in render(app.transcript)
+        assert app.conv.messages()[-1].content == "回复 [REDACTED]"
+
+
+@pytest.mark.asyncio
+async def test_tool_errors_and_all_output_are_redacted_with_red_summary(tmp_path: Path) -> None:
+    from yincode.tool import Registry
+
+    tool = WaitingTool("读取失败 unit-test-secret other-test-secret", is_error=True)
+    tool.release.set()
+    registry = Registry()
+    registry.register(tool)
+    fake = FakeProvider(cfg())
+    app = YinCodeApp(
+        [cfg(), cfg("备用", "other-test-secret")],
+        provider_factory=lambda _: fake,
+        cwd=tmp_path,
+        registry=registry,
+    )
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+        await app.submit("读取错误")
+        for event in (
+            StreamEvent(text="前言 unit-test-secret"),
+            StreamEvent(tool_calls=[ToolCall("bad", "read_file", '{"path":"other-test-secret"}')]),
+            StreamEvent(done=True),
+            StreamEvent(text="结语 other-test-secret"),
+            StreamEvent(done=True),
+        ):
+            await fake.events.put(event)
+        await wait_for_state(app, SessionState.IDLE)
+        output = render(app.transcript)
+        assert "unit-test-secret" not in output and "other-test-secret" not in output
+        assert "[REDACTED]" in output
+        assert any(
+            "读取失败" in render([block]) and "red" in str(getattr(block, "style", ""))
+            for block in app.transcript
+        )
+        history = str(app.conv.messages())
+        assert "unit-test-secret" not in history and "other-test-secret" not in history
+
+
+@pytest.mark.asyncio
+async def test_quit_cancels_active_tool_and_pairs_the_entire_call_batch(tmp_path: Path) -> None:
+    from yincode.tool import Registry
+
+    tool = WaitingTool()
+    registry = Registry()
+    registry.register(tool)
+    fake = FakeProvider(cfg())
+    app = YinCodeApp([cfg()], provider_factory=lambda _: fake, cwd=tmp_path, registry=registry)
+    async with app.run_test() as pilot:
+        await app.submit("慢工具")
+        await fake.events.put(
+            StreamEvent(
+                tool_calls=[
+                    ToolCall("active", "read_file", '{"path":"first.txt"}'),
+                    ToolCall("pending", "read_file", '{"path":"second.txt"}'),
+                ]
+            )
+        )
+        await fake.events.put(StreamEvent(done=True))
+        await asyncio.wait_for(tool.started.wait(), 2)
+        task = app._stream_task
+        await pilot.press("ctrl+c")
+    assert task is not None and task.done() and task.cancelled()
+    assert tool.cleaned and fake.stream_closed == 1 and fake.client_closed == 1
+    messages = app.conv.messages()
+    results = [result for message in messages for result in message.tool_results]
+    assert [result.tool_call_id for result in results] == ["active", "pending"]
+    assert all(result.is_error for result in results)
+    assert messages[-1].role == "assistant"
+    assert app._exception is None
+
+
+@pytest.mark.parametrize(
+    "view_kind",
+    [
+        "tool_name",
+        "tool_args",
+        "result",
+        "running",
+        "streaming",
+        "markdown",
+        "error",
+        "user",
+        "status",
+    ],
+)
+@pytest.mark.parametrize(
+    ("untrusted", "visible"),
+    [
+        ("before\x1b]52;c;Y2xpcGJvYXJk\x1b\\after", r"\x1b]52;c;Y2xpcGJvYXJk\x1b\after"),
+        ("before\x1b[2Jafter", r"\x1b[2J"),
+        (
+            "before\x00\x07\x08\r\v\f\x1f\x7f\x80\x85\x9b\x9fafter",
+            r"\x00\x07\x08\x0d\x0b\x0c\x1f\x7f\x80\x85\x9b\x9f",
+        ),
+    ],
+    ids=["clipboard", "clear-screen", "ascii-and-c1"],
+)
+def test_console_replay_escapes_untrusted_terminal_controls(
+    view_kind: str, untrusted: str, visible: str
+) -> None:
+    blocks = {
+        "tool_name": lambda: view.tool_line(untrusted, "args"),
+        "tool_args": lambda: view.tool_line("bash", untrusted),
+        "result": lambda: view.tool_result_summary(untrusted, False),
+        "running": lambda: view.tool_streaming_block("bash", untrusted, 0.2),
+        "streaming": lambda: view.streaming_block(untrusted, 0.2),
+        "markdown": lambda: view.render_markdown(untrusted, 0.2),
+        "error": lambda: view.error_block(untrusted, 0.2),
+        "user": lambda: view.user_block(untrusted),
+        "status": lambda: view.status_bar(untrusted, untrusted),
+    }
+    output = render([blocks[view_kind]()], width=200)
+    assert all(
+        char in "\n\t" or not (ord(char) < 32 or 127 <= ord(char) <= 159) for char in output
+    ), repr(output)
+    assert visible in output
+    assert "before" in output and "after" in output
+
+
+def test_terminal_escaping_preserves_unicode_newlines_tabs_and_rich_styles() -> None:
+    block = view.user_block("蛇🐍\n\t缩进")
+    assert block.plain == "● 蛇🐍\n\t缩进"
+    assert "蛇🐍" in render([block]) and "缩进" in render([block])
+    error = view.error_block("错误\x1b[2J")
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=True, color_system="standard", no_color=False)
+    console.print(error)
+    output = buffer.getvalue()
+    assert "\x1b[1;31m" in output
+    assert r"\x1b[2J" in output and "\x1b[2J" not in output
+
+
+def test_tool_display_limits_count_escaped_control_bytes() -> None:
+    line = view.tool_line("bash", "\x1b" * 500)
+    summary = view.tool_result_summary("\x1b" * 4000, False)
+    assert "\x1b" not in line.plain + summary.plain
+    assert len(line.plain.encode("utf-8")) <= 512
+    assert len(summary.plain.encode("utf-8")) <= 4096
+    assert len(summary.plain.splitlines()) <= 8
+    assert "[truncated]" in line.plain and "[truncated]" in summary.plain
+
+
+@pytest.mark.asyncio
+async def test_ui_escapes_tool_controls_while_followup_receives_original_result(
+    tmp_path: Path,
+) -> None:
+    from yincode.tool import Registry
+
+    unsafe = "原文\x1b]52;c;Y2xpcGJvYXJk\x1b\\\x1b[2J\n\t蛇🐍"
+    tool = WaitingTool(unsafe)
+    tool.release.set()
+    registry = Registry()
+    registry.register(tool)
+    fake = FakeProvider(cfg())
+    app = YinCodeApp([cfg()], provider_factory=lambda _: fake, cwd=tmp_path, registry=registry)
+    async with app.run_test():
+        await app.submit("读取")
+        for event in (
+            StreamEvent(tool_calls=[ToolCall("raw", "read_file", '{"path":"sample.txt"}')]),
+            StreamEvent(done=True),
+            StreamEvent(text="完成"),
+            StreamEvent(done=True),
+        ):
+            await fake.events.put(event)
+        await wait_for_state(app, SessionState.IDLE)
+        assert fake.requests[1][-1].tool_results[0].content == unsafe
+        assert app.conv.messages()[2].tool_results[0].content == unsafe
+    output = render(app.transcript)
+    assert "\x1b" not in output
+    assert r"\x1b]52;c;Y2xpcGJvYXJk" in output
+    assert r"\x1b[2J" in output and "蛇🐍" in output

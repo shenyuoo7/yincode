@@ -26,9 +26,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     app = None
     exit_code = 0
     try:
+        from yincode.tool import new_default_registry
         from yincode.tui import YinCodeApp
 
-        app = YinCodeApp(cfg.providers, cwd=str(cwd))
+        app = YinCodeApp(cfg.providers, cwd=str(cwd), registry=new_default_registry(cwd=cwd))
         app.run()
     except KeyboardInterrupt:
         pass

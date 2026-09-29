@@ -4,26 +4,29 @@ import asyncio
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
-from yincode.llm import StreamEvent
+from yincode.agent import Event
 
 if TYPE_CHECKING:
     from .app import YinCodeApp
 
 
 async def consume_stream(app: "YinCodeApp") -> None:
-    iterator: AsyncIterator[StreamEvent] | None = None
+    iterator: AsyncIterator[Event] | None = None
     error: Exception | None = None
     completed = False
     try:
-        assert app.provider is not None
-        iterator = app.provider.stream(app.conv.messages())
+        assert app.agent is not None
+        iterator = app.agent.run(app.conv)
         async for event in iterator:
             if event.err is not None:
                 error = event.err
                 break
             if event.text:
-                app.cur_reply += event.text
+                # 分片可能把密钥拆开；对累积正文再脱敏，保护动态区和完成块。
+                app.cur_reply = app._redact(app.cur_reply + event.text)
                 app._refresh_streaming_view(follow_output=True)
+            if event.tool is not None:
+                app._handle_tool_event(event.tool)
             if event.done:
                 completed = True
                 break

@@ -1,16 +1,49 @@
 """统一消息、流事件与模型适配器接口。"""
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
-from typing import Literal, Protocol
+from dataclasses import dataclass, field
+from typing import Any, Literal, Protocol
 
 from yincode.config import ProviderConfig
+
+ROLE_USER = "user"
+ROLE_ASSISTANT = "assistant"
+ROLE_TOOL = "tool"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCall:
+    """模型工具请求；input 保留原始 JSON 对象字符串。"""
+
+    id: str
+    name: str
+    input: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResult:
+    """以调用 id 配对的历史结果。"""
+
+    tool_call_id: str
+    content: str
+    is_error: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ToolDefinition:
+    """供协议适配器转换的工具定义。"""
+
+    name: str
+    description: str
+    input_schema: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
 class Message:
-    role: Literal["user", "assistant"]
-    content: str
+    role: Literal["user", "assistant", "tool"]
+    content: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    tool_results: list[ToolResult] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,10 +51,11 @@ class StreamEvent:
     text: str = ""
     done: bool = False
     err: Exception | None = None
+    tool_calls: list[ToolCall] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        if sum((bool(self.text), self.done, self.err is not None)) > 1:
-            raise ValueError("流事件只能包含正文、完成或错误中的一种")
+        if sum((bool(self.text), self.done, self.err is not None, bool(self.tool_calls))) > 1:
+            raise ValueError("流事件只能包含正文、工具调用、完成或错误中的一种")
 
 
 class Provider(Protocol):
@@ -31,7 +65,9 @@ class Provider(Protocol):
     @property
     def model(self) -> str: ...
 
-    def stream(self, msgs: list[Message]) -> AsyncIterator[StreamEvent]: ...
+    def stream(
+        self, msgs: list[Message], tools: list[ToolDefinition]
+    ) -> AsyncIterator[StreamEvent]: ...
 
     async def aclose(self) -> None: ...
 
