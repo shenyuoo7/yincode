@@ -180,11 +180,23 @@ class YinCodeApp(App[None]):
         if self.state is SessionState.STREAMING and not self._resources_closing:
             self._refresh_streaming_view()
 
-    def _refresh_streaming_view(self) -> None:
-        self.query_one("#streaming", Static).update(
-            streaming_block(self.cur_reply, time.monotonic() - self.turn_start)
-        )
-        self.query_one("#streaming-panel", ScrollableContainer).scroll_end(animate=False)
+    def _refresh_streaming_view(self, *, follow_output: bool = False) -> None:
+        panel = self.query_one("#streaming-panel", ScrollableContainer)
+        was_at_end = panel.is_vertical_scroll_end
+        previous_scroll = panel.scroll_y
+        streaming = self.query_one("#streaming", Static)
+        streaming.update(streaming_block(self.cur_reply, time.monotonic() - self.turn_start))
+        if follow_output and was_at_end:
+
+            def follow_after_layout() -> None:
+                if self.state is not SessionState.STREAMING or self._resources_closing:
+                    return
+                # 新尺寸要等布局完成；等待期间用户滚动时取消这次跟随。
+                if panel.scroll_y == previous_scroll:
+                    panel.scroll_end(animate=False, immediate=True, x_axis=False)
+
+            # 从内容组件队列排在其布局请求之后，避免读到旧虚拟高度。
+            streaming.call_after_refresh(follow_after_layout)
 
     def _finish_with_assistant(self, reply: str) -> None:
         self.conv.add_assistant(reply)

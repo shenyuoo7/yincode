@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console, RenderableType
 from rich.markdown import Markdown
+from textual.containers import ScrollableContainer
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
 from yincode.config import ProviderConfig
@@ -370,3 +371,76 @@ async def test_teardown_stops_producers_before_widgets_are_removed(tmp_path: Pat
     assert app._exception is None
     assert fake.client_closed == 1
     assert fake.stream_closed == 1
+
+
+@pytest.mark.asyncio
+async def test_timer_refresh_preserves_user_scroll_position(tmp_path: Path) -> None:
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        await app.submit("长回复")
+        await fake.events.put(StreamEvent(text="正文\n" * 100))
+        await pilot.pause()
+        panel = app.query_one("#streaming-panel", ScrollableContainer)
+        assert panel.is_vertical_scroll_end
+        panel.scroll_home(animate=False)
+        await pilot.pause()
+        assert panel.scroll_y == 0
+        # 整个等待期间没有新正文，只有持续计时刷新。
+        await pilot.pause(0.25)
+        assert panel.scroll_y == 0
+
+
+@pytest.mark.asyncio
+async def test_increment_preserves_scroll_and_follow_resumes_at_bottom(tmp_path: Path) -> None:
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        await app.submit("长回复")
+        await fake.events.put(StreamEvent(text="正文\n" * 100))
+        await pilot.pause()
+        panel = app.query_one("#streaming-panel", ScrollableContainer)
+        panel.scroll_to(y=25, animate=False)
+        await pilot.pause()
+        assert panel.scroll_y == 25
+        await fake.events.put(StreamEvent(text="新增\n" * 30))
+        await pilot.pause()
+        assert panel.scroll_y == 25
+        assert not panel.is_vertical_scroll_end
+        panel.scroll_end(animate=False)
+        await pilot.pause()
+        assert panel.is_vertical_scroll_end
+        previous_bottom = panel.scroll_y
+        await fake.events.put(StreamEvent(text="继续\n" * 30))
+        await pilot.pause()
+        assert panel.scroll_y > previous_bottom
+        assert panel.is_vertical_scroll_end
+
+
+@pytest.mark.asyncio
+async def test_queued_deltas_follow_the_new_virtual_height(tmp_path: Path) -> None:
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        await app.submit("长回复")
+        # 多个增量在一次布局刷新之前排队，不能依赖更新前的 max_scroll_y。
+        for _ in range(10):
+            await fake.events.put(StreamEvent(text="正文\n" * 10))
+        await pilot.pause()
+        panel = app.query_one("#streaming-panel", ScrollableContainer)
+        assert panel.max_scroll_y > 90
+        assert panel.is_vertical_scroll_end
+
+
+@pytest.mark.asyncio
+async def test_user_scroll_cancels_a_follow_waiting_for_layout(tmp_path: Path) -> None:
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        await app.submit("长回复")
+        await fake.events.put(StreamEvent(text="正文\n" * 100))
+        await pilot.pause()
+        panel = app.query_one("#streaming-panel", ScrollableContainer)
+        assert panel.is_vertical_scroll_end
+        app.cur_reply += "新增\n" * 30
+        app._refresh_streaming_view(follow_output=True)
+        # 用户在布局回调执行前离开底部，已经排队的跟随也必须取消。
+        panel.scroll_home(animate=False, immediate=True)
+        await pilot.pause()
+        assert panel.scroll_y == 0

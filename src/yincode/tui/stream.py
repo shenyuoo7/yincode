@@ -23,7 +23,7 @@ async def consume_stream(app: "YinCodeApp") -> None:
                 break
             if event.text:
                 app.cur_reply += event.text
-                app._refresh_streaming_view()
+                app._refresh_streaming_view(follow_output=True)
             if event.done:
                 completed = True
                 break

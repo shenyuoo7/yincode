@@ -14,9 +14,24 @@ from yincode.prompt import SYSTEM_PROMPT
 class OpenAIProvider:
     def __init__(self, cfg: ProviderConfig, *, client: AsyncOpenAI | None = None) -> None:
         self._cfg = cfg
-        self._client = client or AsyncOpenAI(
-            api_key=cfg.api_key, base_url=cfg.base_url, max_retries=0
-        )
+        if client is None:
+            self._client = AsyncOpenAI(
+                api_key=cfg.api_key,
+                base_url=cfg.base_url or "https://api.openai.com/v1",
+                organization="",
+                project="",
+                admin_api_key="",
+                webhook_secret="",
+                max_retries=0,
+            )
+            # 显式空值阻止环境身份回填，清理 SDK 无条件合入的环境请求头。
+            self._client.organization = None
+            self._client.project = None
+            self._client.admin_api_key = None
+            self._client._custom_headers = {}
+            self._client._ambient_authorizations = frozenset()
+        else:
+            self._client = client
         self._streams: set[AsyncStream[ChatCompletionChunk]] = set()
 
     @property
@@ -34,6 +49,7 @@ class OpenAIProvider:
                 messages.append({"role": "user", "content": message.content})
             else:
                 messages.append({"role": "assistant", "content": message.content})
+        completed = False
         try:
             stream = await self._client.chat.completions.create(
                 model=self.model, messages=messages, stream=True
@@ -43,11 +59,16 @@ class OpenAIProvider:
                 try:
                     async for chunk in stream:
                         if chunk.choices:
-                            text = chunk.choices[0].delta.content
+                            choice = chunk.choices[0]
+                            if choice.finish_reason:
+                                completed = True
+                            text = choice.delta.content
                             if text:
                                 yield StreamEvent(text=text)
                 finally:
                     self._streams.discard(stream)
+            if not completed:
+                raise RuntimeError("响应流提前结束，未收到完整回复")
         except asyncio.CancelledError:
             raise
         except Exception as error:

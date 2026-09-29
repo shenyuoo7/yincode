@@ -3,6 +3,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import Literal
 
 import anthropic
@@ -363,3 +364,124 @@ async def test_default_client_uses_configured_endpoint_without_automatic_retries
     finally:
         await provider.aclose()
     assert client.is_closed()
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+async def test_clean_eof_without_protocol_completion_is_an_error(protocol: ProtocolName) -> None:
+    response = ResponseStream(payload(protocol)[:1])
+    http = httpx2.AsyncClient(
+        transport=httpx2.MockTransport(
+            lambda request: httpx2.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=response
+            )
+        )
+    )
+    provider = provider_with_http(config(protocol), http)
+    try:
+        events = [event async for event in provider.stream(HISTORY)]
+        assert events[0] == StreamEvent(text="你好")
+        assert len(events) == 2
+        assert events[1].err is not None
+        assert not any(event.done for event in events)
+        assert response.closed
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+@pytest.mark.parametrize("configured", [False, True])
+async def test_endpoint_comes_only_from_config_or_official_default(
+    protocol: ProtocolName, configured: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://ambient-anthropic.example/")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://ambient-openai.example/v1/")
+    cfg = config(protocol) if configured else replace(config(protocol), base_url=None)
+    provider = new_provider(cfg)
+    try:
+        client = provider._client  # type: ignore[attr-defined]
+        expected = cfg.base_url
+        if expected is None:
+            expected = (
+                "https://api.anthropic.com/"
+                if protocol == "anthropic"
+                else "https://api.openai.com/v1/"
+            )
+        assert str(client.base_url).rstrip("/") == expected.rstrip("/")
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+async def test_owned_client_sends_only_config_identity_and_no_ambient_headers(
+    protocol: ProtocolName, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-anthropic-key")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "ambient-anthropic-token")
+    monkeypatch.setenv(
+        "ANTHROPIC_CUSTOM_HEADERS",
+        "x-api-key: ambient-key-override\nAuthorization: Bearer ambient-token\nX-Ambient: foreign",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-openai-key")
+    monkeypatch.setenv("OPENAI_ORG_ID", "ambient-org")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "ambient-project")
+    monkeypatch.setenv("OPENAI_ADMIN_KEY", "ambient-admin-key")
+    monkeypatch.setenv(
+        "OPENAI_CUSTOM_HEADERS",
+        "Authorization: Bearer ambient-key-override\nOpenAI-Organization: ambient-header-org\n"
+        "OpenAI-Project: ambient-header-project\nX-Ambient: foreign",
+    )
+    requests: list[httpx2.Request] = []
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=ResponseStream(payload(protocol)),
+        )
+
+    provider = new_provider(config(protocol))
+    client = provider._client  # type: ignore[attr-defined]
+    # 仅替换已构造 SDK 的传输客户端，保留产品构造时得到的身份及请求头配置。
+    await client._client.aclose()
+    client._client = httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
+    try:
+        assert [event async for event in provider.stream(HISTORY)][-1] == StreamEvent(done=True)
+        assert len(requests) == 1
+        headers = requests[0].headers
+        assert "x-ambient" not in headers
+        assert "openai-organization" not in headers
+        assert "openai-project" not in headers
+        if protocol == "anthropic":
+            assert headers["x-api-key"] == TEST_KEY
+            assert "authorization" not in headers
+        else:
+            assert headers["authorization"] == f"Bearer {TEST_KEY}"
+            assert client.admin_api_key is None
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+async def test_explicitly_injected_client_keeps_deliberate_headers(
+    protocol: ProtocolName, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Injected: kept")
+    monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "X-Injected: kept")
+    requests: list[httpx2.Request] = []
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=ResponseStream(payload(protocol)),
+        )
+
+    http = httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
+    provider = provider_with_http(config(protocol), http)
+    try:
+        assert [event async for event in provider.stream(HISTORY)][-1] == StreamEvent(done=True)
+        assert requests[0].headers["x-injected"] == "kept"
+    finally:
+        await provider.aclose()
