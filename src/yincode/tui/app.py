@@ -5,6 +5,7 @@ import time
 from collections.abc import Callable
 from enum import Enum, auto
 from pathlib import Path
+from typing import cast
 
 from rich.console import RenderableType
 from rich.text import Text
@@ -12,7 +13,6 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer
-from textual.message import Message
 from textual.screen import Screen
 from textual.timer import Timer
 from textual.widgets import OptionList, RichLog, Static, TextArea
@@ -37,24 +37,20 @@ class SessionState(Enum):
 class MessageInput(TextArea):
     """Enter 发消息，Alt+Enter 插入换行。"""
 
-    class Submitted(Message):
-        def __init__(self, text: str) -> None:
-            super().__init__()
-            self.text = text
-
-    def on_key(self, event: events.Key) -> None:
+    async def on_key(self, event: events.Key) -> None:
         if event.key not in ("enter", "alt+enter"):
             return
         # 字符与控制键必须在同一组件队列处理，避免优先绑定抢先读取旧正文。
         event.stop()
         event.prevent_default()
         if event.key == "enter":
-            self.action_submit_message()
+            await self.action_submit_message()
         else:
             self.action_insert_newline()
 
-    def action_submit_message(self) -> None:
-        self.post_message(self.Submitted(self.text))
+    async def action_submit_message(self) -> None:
+        # 接受、清空与状态切换必须完成后，才处理下一个草稿字符。
+        await cast(YinCodeApp, self.app).submit(self.text)
 
     def action_insert_newline(self) -> None:
         self.insert("\n")
@@ -160,9 +156,6 @@ class YinCodeApp(App[None]):
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if self.state is SessionState.SELECTING and not self._resources_closing:
             self._select_provider(event.option_index)
-
-    async def on_message_input_submitted(self, event: MessageInput.Submitted) -> None:
-        await self.submit(event.text)
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         event.text_area.styles.height = min(7, event.text_area.document.line_count + 2)

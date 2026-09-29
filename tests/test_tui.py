@@ -569,3 +569,38 @@ async def test_same_height_increment_does_not_leave_follow_for_window_resize(
         await pilot.pause()
         assert panel.max_scroll_y > previous_bottom
         assert panel.scroll_y == previous_bottom
+
+
+@pytest.mark.asyncio
+async def test_rapid_submit_clears_before_following_draft_characters(tmp_path: Path) -> None:
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        post_rapid_keys(app, "a", "enter", "b")
+        await pilot.pause()
+        assert app.conv.messages() == [Message("user", "a")]
+        assert fake.requests == [[Message("user", "a")]]
+        assert app.query_one("#input", TextArea).text == "b"
+
+
+@pytest.mark.asyncio
+async def test_rapid_streaming_rejection_preserves_the_new_draft(tmp_path: Path) -> None:
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        post_rapid_keys(app, "a", "enter", "b", "enter", "c")
+        await pilot.pause()
+        assert app.state is SessionState.STREAMING
+        assert app.conv.messages() == [Message("user", "a")]
+        assert fake.requests == [[Message("user", "a")]]
+        assert app.query_one("#input", TextArea).text == "bc"
+
+
+@pytest.mark.asyncio
+async def test_rapid_blank_rejection_preserves_following_draft(tmp_path: Path) -> None:
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        post_rapid_keys(app, " ", "enter", "b")
+        await pilot.pause()
+        assert app.state is SessionState.IDLE
+        assert app.conv.messages() == []
+        assert fake.requests == []
+        assert app.query_one("#input", TextArea).text == " b"
