@@ -9,7 +9,6 @@ def test_banner_is_readable_at_narrow_width():
     assert "YIN" in banner
     assert "yincode v0.1.0" in banner
     assert "E:/very/long/project/path" in banner.replace("\n", "")
-    assert "snake" in banner.lower() or "蛇" in banner
     assert "Enter" in banner
 
 

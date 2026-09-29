@@ -21,7 +21,7 @@ from yincode import __version__
 from yincode.config import ProviderConfig, redact
 from yincode.conversation import Conversation
 from yincode.llm import Provider, new_provider
-from yincode.prompt import render_banner
+from yincode.prompt import render_banner_text
 
 from .select import provider_options
 from .stream import consume_stream
@@ -100,6 +100,7 @@ class YinCodeApp(App[None]):
         self._timer: Timer | None = None
         self._pending_stream_follow: float | None = None
         self.transcript: list[RenderableType] = []
+        self._history_width = 0
         self._resources_closing = False
         self._resources_closed = False
         self._close_lock = asyncio.Lock()
@@ -118,8 +119,11 @@ class YinCodeApp(App[None]):
         self.screen.screen_layout_refresh_signal.subscribe(
             self, self._follow_stream_after_layout, immediate=True
         )
+        self.screen.screen_layout_refresh_signal.subscribe(
+            self, self._resize_history_after_layout, immediate=True
+        )
         self.query_one("#streaming-panel").display = False
-        self.transcript.append(Text(render_banner(__version__, str(self.cwd), self.size.width)))
+        self.transcript.append(render_banner_text(__version__, str(self.cwd), self.size.width))
         if len(self.providers) == 1:
             self._select_provider(0)
         else:
@@ -249,9 +253,13 @@ class YinCodeApp(App[None]):
         self.transcript.append(block)
         self.query_one("#log", RichLog).write(block)
 
-    def on_resize(self, event: events.Resize) -> None:
-        if self.transcript and not self._resources_closing:
-            self.call_after_refresh(self._redraw_history)
+    def _resize_history_after_layout(self, screen: Screen) -> None:
+        if self._resources_closing:
+            return
+        # App 的 Resize 消息可能早于子组件重排，等日志区实际宽度应用后再重画。
+        log = screen.query_one("#log", RichLog)
+        if log.content_size.width != self._history_width:
+            self._redraw_history()
 
     def _redraw_history(self) -> None:
         if not self.transcript or self._resources_closing:
@@ -259,8 +267,9 @@ class YinCodeApp(App[None]):
         log = self.query_one("#log", RichLog)
         if not log.display or log.content_size.width == 0:
             return
+        self._history_width = log.content_size.width
         # RichLog 保存的是已渲染行；尺寸变化后从原始块重新排版。
-        self.transcript[0] = Text(render_banner(__version__, str(self.cwd), log.content_size.width))
+        self.transcript[0] = render_banner_text(__version__, str(self.cwd), log.content_size.width)
         log.clear()
         for block in self.transcript:
             log.write(block)

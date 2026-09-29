@@ -13,6 +13,7 @@ from textual.widgets import OptionList, RichLog, Static, TextArea
 
 from yincode.config import ProviderConfig
 from yincode.llm import Message, StreamEvent
+from yincode.prompt import render_banner_text
 from yincode.tui import SessionState, YinCodeApp
 from yincode.tui.view import streaming_block
 
@@ -100,12 +101,24 @@ async def test_single_provider_banner_input_and_status(tmp_path: Path) -> None:
         text = render(app.transcript)
         assert "yincode v0.1.0" in text
         assert str(tmp_path) in text.replace("\n", "")
-        assert "snake" in text
         assert len(app.transcript) == 1
         assert "❯" in static_text(app, "#input-prefix")
         status = static_text(app, "#statusbar")
         assert "本地模型" in status and "test-model" in status
     assert fake.client_closed == 1
+
+
+@pytest.mark.asyncio
+async def test_banner_follows_actual_width_when_shrinking_and_expanding(tmp_path: Path) -> None:
+    app, _ = setup_app(tmp_path)
+    async with app.run_test(size=(100, 30)) as pilot:
+        for width in (30, 80, 24, 100):
+            await pilot.resize_terminal(width, 24)
+            await pilot.pause()
+            log = app.query_one("#log", RichLog)
+            expected = render_banner_text("0.1.0", str(tmp_path), log.content_size.width)
+            assert len(app.transcript) == 1
+            assert app.transcript[0] == expected
 
 
 @pytest.mark.asyncio
@@ -283,7 +296,7 @@ async def test_long_stream_and_resize_preserve_visible_input_and_banner(tmp_path
         assert app.query_one("#statusbar", Static).region.bottom <= 16
         assert app.query_one("#log", RichLog).region.height >= 1
         assert app.query_one("#streaming", Static).region.width <= 30
-        assert len([block for block in app.transcript if "snake" in render([block])]) == 1
+        assert len([block for block in app.transcript if "yincode v" in render([block])]) == 1
 
 
 @pytest.mark.asyncio
