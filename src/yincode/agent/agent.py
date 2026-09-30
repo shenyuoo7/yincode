@@ -5,16 +5,18 @@ import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
+from pathlib import Path
 from typing import Any
 
+from yincode import __version__, prompt
 from yincode.conversation import Conversation
-from yincode.llm import Provider, StreamEvent, ToolCall, ToolDefinition, ToolResult, Usage
+from yincode.llm import Provider, Request, StreamEvent, System, ToolCall, ToolResult, Usage
 from yincode.llm._json import object_from_json
-from yincode.prompt import PLAN_MODE_REMINDER
 from yincode.tool import Registry
 
 MAX_ITERATIONS = 25
 MAX_UNKNOWN_RUN = 3
+PLAN_REMINDER_INTERVAL = 4
 NOTICE_MAX_ITER = "（已达最大迭代轮数 25，自动停止；可继续发消息推进。）"
 NOTICE_UNKNOWN_TOOLS = "（连续多轮只请求到未注册的工具，自动停止。）"
 NOTICE_STREAM_ERR = "（请求出错，本轮已中断。）"
@@ -90,12 +92,16 @@ class Agent:
         self,
         provider: Provider,
         registry: Registry,
+        version: str = __version__,
         *,
+        cwd: str | Path | None = None,
         redactor: Callable[[str], str] | None = None,
         secrets: tuple[str, ...] = (),
     ) -> None:
         self._provider = provider
         self._registry = registry
+        self._version = version
+        self._cwd = Path(cwd if cwd is not None else Path.cwd()).resolve()
         self._redact = redactor or (lambda text: text)
         self._secrets = tuple(secret for secret in secrets if secret)
 
@@ -151,13 +157,11 @@ class Agent:
 
     async def _stream_once(
         self,
-        conv: Conversation,
-        definitions: list[ToolDefinition],
-        suffix: str,
+        req: Request,
         cancel: asyncio.Event,
         state: StreamState,
     ) -> AsyncIterator[Event]:
-        iterator = self._provider.stream(conv.messages(), definitions, suffix)
+        iterator = self._provider.stream(req)
         pending = ""
         next_task: asyncio.Task[StreamEvent] | None = None
         cancel_task: asyncio.Task[bool] | None = None
@@ -281,13 +285,17 @@ class Agent:
             else self._registry.definitions()
         )
         allowed_names = {definition.name for definition in definitions}
-        suffix = PLAN_MODE_REMINDER if mode is Mode.PLAN else ""
         history_calls: list[ToolCall] = []
         slots: list[ToolResult | None] = []
         batch_saved = False
         final_saved = False
         unknown_run = 0
         try:
+            environment = await self._environment(cancel)
+            system = System(
+                stable=prompt.build_system_prompt(),
+                environment=environment or "",
+            )
             for iteration in range(1, MAX_ITERATIONS + 1):
                 if cancel.is_set():
                     conv.add_assistant(NOTICE_CANCELLED)
@@ -297,7 +305,13 @@ class Agent:
                     return
                 yield Event(iter=iteration)
                 state = StreamState()
-                async for event in self._stream_once(conv, definitions, suffix, cancel, state):
+                reminder = (
+                    prompt.plan_reminder((iteration - 1) % PLAN_REMINDER_INTERVAL == 0)
+                    if mode is Mode.PLAN
+                    else ""
+                )
+                req = Request(conv.messages(), definitions, system, reminder)
+                async for event in self._stream_once(req, cancel, state):
                     yield event
                 if state.cancelled:
                     conv.add_assistant(NOTICE_CANCELLED)
@@ -392,6 +406,25 @@ class Agent:
                 self._finish_batch(conv, history_calls, slots)
             if not final_saved:
                 conv.add_assistant("[请求已取消。]")
+
+    async def _environment(self, cancel: asyncio.Event) -> str | None:
+        """环境采集也受本轮取消控制，收尾后再允许下一轮运行。"""
+        if cancel.is_set():
+            return None
+        task = asyncio.create_task(
+            prompt.gather_environment(self._version, self._provider.model, cwd=self._cwd)
+        )
+        waiter = asyncio.create_task(cancel.wait())
+        try:
+            done, _ = await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+            if waiter in done or cancel.is_set():
+                return None
+            return self._redact(task.result().render())
+        finally:
+            waiter.cancel()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, waiter, return_exceptions=True)
 
     @staticmethod
     def _finish_batch(

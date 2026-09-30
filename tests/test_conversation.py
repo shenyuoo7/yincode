@@ -44,6 +44,17 @@ def test_last_role_tracks_conversation_tail():
     assert conv.last_role() == "assistant"
 
 
+def test_request_defaults_are_independent_and_cache_usage_is_available():
+    from yincode.llm import Message, Request, System, Usage
+
+    first = Request()
+    first.messages.append(Message("user", "hello"))
+    assert Request().messages == []
+    assert first.system == System()
+    usage = Usage(1, 2, cache_write=3, cache_read=4)
+    assert (usage.cache_write, usage.cache_read) == (3, 4)
+
+
 def test_messages_cannot_be_mutated_through_snapshot():
     mod = importlib.import_module("yincode.conversation")
     conv = mod.Conversation()

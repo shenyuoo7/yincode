@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from yincode.conversation import Conversation
-from yincode.llm import Message, StreamEvent, ToolCall, ToolDefinition, Usage
+from yincode.llm import Message, Request, StreamEvent, ToolCall, ToolDefinition, Usage
 
 
 class ScriptProvider:
@@ -16,16 +16,14 @@ class ScriptProvider:
         self.scripts = scripts
         self.requests: list[list[Message]] = []
         self.definitions: list[list[ToolDefinition]] = []
-        self.suffixes: list[str] = []
+        self.assembled: list[Request] = []
         self.closed = 0
 
-    async def stream(
-        self, msgs: list[Message], tools: list[ToolDefinition], system_suffix: str = ""
-    ) -> AsyncIterator[StreamEvent]:
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
         index = len(self.requests)
-        self.requests.append(msgs)
-        self.definitions.append(tools)
-        self.suffixes.append(system_suffix)
+        self.requests.append(req.messages)
+        self.definitions.append(req.tools)
+        self.assembled.append(req)
         try:
             for event in self.scripts[index]:
                 yield event
@@ -250,7 +248,7 @@ async def test_empty_continuation_produces_visible_nonempty_tail():
 
 async def test_plan_mode_filters_and_blocks_malicious_write(tmp_path: Path):
     from yincode.agent import Agent, Mode
-    from yincode.prompt import PLAN_MODE_REMINDER
+    from yincode.prompt import plan_reminder
     from yincode.tool import new_default_registry
 
     call = ToolCall("evil", "write_file", '{"path":"plan.txt","content":"bad"}')
@@ -262,7 +260,10 @@ async def test_plan_mode_filters_and_blocks_malicious_write(tmp_path: Path):
     )
     conv = conversation()
     events = [e async for e in Agent(provider, new_default_registry(tmp_path)).run(conv, Mode.PLAN)]
-    assert provider.suffixes == [PLAN_MODE_REMINDER, PLAN_MODE_REMINDER]
+    assert [req.reminder for req in provider.assembled] == [
+        plan_reminder(True),
+        plan_reminder(False),
+    ]
     assert all(
         {tool.name for tool in defs} == {"read_file", "glob", "grep"}
         for defs in provider.definitions
@@ -305,7 +306,7 @@ async def test_cancel_while_provider_is_silent_closes_stream():
             self.started = asyncio.Event()
             self.closed_stream = asyncio.Event()
 
-        async def stream(self, msgs, tools, system_suffix=""):
+        async def stream(self, req):
             self.started.set()
             try:
                 await asyncio.Event().wait()
@@ -517,3 +518,69 @@ async def test_cancel_keeps_completed_result_in_read_only_batch():
         ("fast", "fast result", False),
         ("slow", "工具执行已取消，未完成。", True),
     ]
+
+
+async def test_plan_reminder_cadence_stable_environment_and_cache_usage(tmp_path: Path):
+    from yincode.agent import Agent, Mode
+    from yincode.prompt import build_system_prompt, plan_reminder
+    from yincode.tool import new_default_registry
+
+    (tmp_path / "sample.txt").write_text("sample", encoding="utf-8")
+    scripts = [
+        [
+            StreamEvent(tool_calls=[ToolCall(f"c{i}", "read_file", '{"path":"sample.txt"}')]),
+            StreamEvent(done=True),
+        ]
+        for i in range(9)
+    ] + [[StreamEvent(usage=Usage(1, 2, 3, 4)), StreamEvent(text="plan"), StreamEvent(done=True)]]
+    provider = ScriptProvider(scripts)
+    conv = conversation()
+    events = await collect(
+        Agent(provider, new_default_registry(tmp_path), "test-version", cwd=tmp_path).run(
+            conv, Mode.PLAN
+        )
+    )
+    assert len(provider.assembled) == 10
+    assert [req.reminder for req in provider.assembled] == [
+        plan_reminder(i in (1, 5, 9)) for i in range(1, 11)
+    ]
+    assert {req.system.stable for req in provider.assembled} == {build_system_prompt()}
+    assert all(
+        str(tmp_path) in req.system.environment and "test-version" in req.system.environment
+        for req in provider.assembled
+    )
+    assert "<system-reminder>" not in repr(conv.messages())
+    assert [event.usage for event in events if event.usage] == [Usage(1, 2, 3, 4)]
+    normal = ScriptProvider([[StreamEvent(text="normal"), StreamEvent(done=True)]])
+    await collect(Agent(normal, new_default_registry(tmp_path), cwd=tmp_path).run(conversation()))
+    assert normal.assembled[0].system.stable == provider.assembled[0].system.stable
+    assert normal.assembled[0].reminder == ""
+
+
+async def test_cancellation_during_environment_collection_waits_for_cleanup(monkeypatch):
+    from yincode import prompt
+    from yincode.agent import NOTICE_CANCELLED, Agent
+    from yincode.tool import Registry
+
+    started = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    async def delayed_environment(version, model, *, cwd=None):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    monkeypatch.setattr(prompt, "gather_environment", delayed_environment)
+    provider = ScriptProvider([])
+    conv = conversation()
+    cancel = asyncio.Event()
+    task = asyncio.create_task(collect(Agent(provider, Registry()).run(conv, cancel=cancel)))
+    await asyncio.wait_for(started.wait(), 2)
+    cancel.set()
+    events = await asyncio.wait_for(task, 2)
+    assert cleaned.is_set()
+    assert provider.requests == []
+    assert conv.messages()[-1].content == NOTICE_CANCELLED
+    assert events[-1].done

@@ -3,6 +3,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from copy import deepcopy
 from typing import Any
 
 from anthropic import AsyncAnthropic, Omit, omit
@@ -17,17 +18,41 @@ from anthropic.types import (
 )
 
 from yincode.config import ProviderConfig, redact
-from yincode.llm import Message, StreamEvent, ToolCall, ToolDefinition, Usage
+from yincode.llm import Message, Request, StreamEvent, System, ToolCall, Usage
 from yincode.llm._json import object_from_json
-from yincode.prompt import SYSTEM_PROMPT
 
 
 def _json_object(raw: str) -> dict[str, Any]:
     return object_from_json(raw)
 
 
-def _effective_system(suffix: str) -> str:
-    return SYSTEM_PROMPT + "\n\n" + suffix if suffix else SYSTEM_PROMPT
+def build_anthropic_system(system: System) -> list[TextBlockParam]:
+    """缓存稳定前缀；每次运行的环境位于断点之后。"""
+    blocks: list[TextBlockParam] = []
+    if system.stable:
+        blocks.append(
+            {"type": "text", "text": system.stable, "cache_control": {"type": "ephemeral"}}
+        )
+    if system.environment:
+        blocks.append({"type": "text", "text": system.environment})
+    return blocks
+
+
+def _append_reminder_anthropic(messages: list[MessageParam], reminder: str) -> list[MessageParam]:
+    """在独立请求副本末尾追加提醒，保留工具结果在文本之前。"""
+    copied = deepcopy(messages)
+    if not reminder:
+        return copied
+    block: TextBlockParam = {"type": "text", "text": reminder}
+    if copied and copied[-1]["role"] == "user":
+        content = copied[-1]["content"]
+        if isinstance(content, str):
+            copied[-1]["content"] = [{"type": "text", "text": content}, block]
+        else:
+            copied[-1]["content"] = [*content, block]
+    else:
+        copied.append({"role": "user", "content": [block]})
+    return copied
 
 
 def _check_identity(call_id: str, name: str) -> None:
@@ -95,16 +120,16 @@ class AnthropicProvider:
     def model(self) -> str:
         return self._cfg.model
 
-    async def stream(
-        self, msgs: list[Message], tools: list[ToolDefinition], system_suffix: str = ""
-    ) -> AsyncIterator[StreamEvent]:
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
         completed = False
         calls: list[ToolCall] = []
         usage: Usage | None = None
         json_inputs: dict[int, str] = {}
         closed_tools: set[int] = set()
         try:
-            messages = _to_anthropic_messages(msgs)
+            messages = _append_reminder_anthropic(
+                _to_anthropic_messages(req.messages), req.reminder
+            )
             tool_params: list[ToolParam] | Omit = (
                 [
                     {
@@ -112,13 +137,13 @@ class AnthropicProvider:
                         "description": tool.description,
                         "input_schema": tool.input_schema,
                     }
-                    for tool in tools
+                    for tool in req.tools
                 ]
-                if tools
+                if req.tools
                 else omit
             )
-            has_tools = bool(tools) or any(
-                message.tool_calls or message.tool_results for message in msgs
+            has_tools = bool(req.tools) or any(
+                message.tool_calls or message.tool_results for message in req.messages
             )
             thinking: ThinkingConfigParam | Omit = (
                 {"type": "enabled", "budget_tokens": 2048}
@@ -128,7 +153,7 @@ class AnthropicProvider:
             async with self._client.messages.stream(
                 model=self.model,
                 max_tokens=4096,
-                system=_effective_system(system_suffix),
+                system=build_anthropic_system(req.system),
                 messages=messages,
                 thinking=thinking,
                 tools=tool_params,
@@ -186,6 +211,8 @@ class AnthropicProvider:
                     usage = Usage(
                         input_tokens=final_message.usage.input_tokens,
                         output_tokens=final_message.usage.output_tokens,
+                        cache_write=final_message.usage.cache_creation_input_tokens or 0,
+                        cache_read=final_message.usage.cache_read_input_tokens or 0,
                     )
                 finally:
                     self._streams.discard(stream)

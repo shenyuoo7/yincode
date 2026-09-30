@@ -169,6 +169,9 @@ class BashTool(_FileTool):
             if os.name == "nt"
             else "在工作目录使用 /bin/sh 执行命令，返回 stdout、stderr 与退出码。"
         )
+        self._description += (
+            "读文件、找文件、搜内容请优先用 read_file/glob/grep，不要用 bash 拼凑。"
+        )
 
     def _argv(self, command: str) -> list[str]:
         if os.name == "nt":

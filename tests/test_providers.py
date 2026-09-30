@@ -15,14 +15,17 @@ from yincode.config import ProviderConfig
 from yincode.llm import (
     Message,
     Provider,
+    Request,
     StreamEvent,
+    System,
     ToolCall,
     ToolDefinition,
     ToolResult,
     Usage,
     new_provider,
 )
-from yincode.prompt import SYSTEM_PROMPT
+
+TEST_SYSTEM = "稳定测试指令"
 
 ProtocolName = Literal["anthropic", "openai"]
 PROTOCOLS: tuple[ProtocolName, ...] = ("anthropic", "openai")
@@ -180,7 +183,12 @@ async def test_request_contains_history_and_streams_only_body(
     http = httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
     provider = provider_with_http(config(protocol, thinking=thinking), http)
     try:
-        events = [event async for event in provider.stream(HISTORY, [])]
+        events = [
+            event
+            async for event in provider.stream(
+                Request(messages=HISTORY, tools=[], system=System(stable=TEST_SYSTEM))
+            )
+        ]
         expected = [StreamEvent(text="你好"), StreamEvent(text="世界")]
         if protocol == "anthropic":
             expected.append(StreamEvent(usage=Usage(4, 4)))
@@ -199,7 +207,9 @@ async def test_request_contains_history_and_streams_only_body(
         ]
         if protocol == "anthropic":
             assert str(requests[0].url) == "https://compatible.example/v1/messages"
-            assert body["system"] == SYSTEM_PROMPT
+            assert body["system"] == [
+                {"type": "text", "text": TEST_SYSTEM, "cache_control": {"type": "ephemeral"}}
+            ]
             assert body["messages"] == history
             assert body["max_tokens"] == 4096
             if thinking:
@@ -208,7 +218,7 @@ async def test_request_contains_history_and_streams_only_body(
                 assert "thinking" not in body
         else:
             assert str(requests[0].url) == "https://compatible.example/v1/chat/completions"
-            assert body["messages"] == [{"role": "system", "content": SYSTEM_PROMPT}, *history]
+            assert body["messages"] == [{"role": "system", "content": TEST_SYSTEM}, *history]
             assert body["stream_options"] == {"include_usage": True}
             assert "thinking" not in body
     finally:
@@ -217,7 +227,7 @@ async def test_request_contains_history_and_streams_only_body(
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
-async def test_system_suffix_is_appended_to_one_system_message(protocol: ProtocolName) -> None:
+async def test_environment_follows_stable_system(protocol: ProtocolName) -> None:
     requests: list[httpx2.Request] = []
 
     def handle(request: httpx2.Request) -> httpx2.Response:
@@ -232,12 +242,24 @@ async def test_system_suffix_is_appended_to_one_system_message(protocol: Protoco
         config(protocol), httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
     )
     try:
-        events = [event async for event in provider.stream(HISTORY, [], "只读计划模式")]
+        events = [
+            event
+            async for event in provider.stream(
+                Request(
+                    messages=HISTORY,
+                    tools=[],
+                    system=System(stable=TEST_SYSTEM, environment="只读计划模式"),
+                )
+            )
+        ]
         assert events[-1] == StreamEvent(done=True)
         body = json.loads(requests[0].content)
-        system = SYSTEM_PROMPT + "\n\n只读计划模式"
+        system = TEST_SYSTEM + "\n\n只读计划模式"
         if protocol == "anthropic":
-            assert body["system"] == system
+            assert body["system"] == [
+                {"type": "text", "text": TEST_SYSTEM, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "只读计划模式"},
+            ]
             assert body["messages"][0] == {"role": "user", "content": "我叫小明"}
         else:
             assert body["messages"][0] == {"role": "system", "content": system}
@@ -272,7 +294,12 @@ async def test_openai_empty_choices_usage_chunk_emits_once_before_done() -> None
     )
     provider = provider_with_http(config("openai"), http)
     try:
-        assert [event async for event in provider.stream(HISTORY, [])] == [
+        assert [
+            event
+            async for event in provider.stream(
+                Request(messages=HISTORY, tools=[], system=System(stable=TEST_SYSTEM))
+            )
+        ] == [
             StreamEvent(text="你好"),
             StreamEvent(text="世界"),
             StreamEvent(usage=Usage(11, 7)),
@@ -307,7 +334,12 @@ async def test_openai_final_choice_carries_usage() -> None:
     )
     provider = provider_with_http(config("openai"), http)
     try:
-        assert [event async for event in provider.stream(HISTORY, [])] == [
+        assert [
+            event
+            async for event in provider.stream(
+                Request(messages=HISTORY, tools=[], system=System(stable=TEST_SYSTEM))
+            )
+        ] == [
             StreamEvent(text="你好"),
             StreamEvent(text="世界"),
             StreamEvent(usage=Usage(13, 5)),
@@ -339,7 +371,12 @@ async def test_http_error_is_detached_redacted_and_next_request_can_succeed(
     http = httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
     provider = provider_with_http(config(protocol), http)
     try:
-        events = [event async for event in provider.stream(HISTORY, [])]
+        events = [
+            event
+            async for event in provider.stream(
+                Request(messages=HISTORY, tools=[], system=System(stable=TEST_SYSTEM))
+            )
+        ]
         assert len(events) == 1
         error = events[0].err
         assert error is not None
@@ -349,7 +386,12 @@ async def test_http_error_is_detached_redacted_and_next_request_can_succeed(
         assert error.__context__ is None
         assert error.__traceback__ is None
         assert requests == 1
-        assert [event async for event in provider.stream(HISTORY, [])][-1] == StreamEvent(done=True)
+        assert [
+            event
+            async for event in provider.stream(
+                Request(messages=HISTORY, tools=[], system=System(stable=TEST_SYSTEM))
+            )
+        ][-1] == StreamEvent(done=True)
         assert requests == 2
     finally:
         await provider.aclose()
@@ -369,7 +411,12 @@ async def test_stream_error_closes_response_and_emits_one_redacted_error(
     )
     provider = provider_with_http(config(protocol), http)
     try:
-        events = [event async for event in provider.stream(HISTORY, [])]
+        events = [
+            event
+            async for event in provider.stream(
+                Request(messages=HISTORY, tools=[], system=System(stable=TEST_SYSTEM))
+            )
+        ]
         assert events[0] == StreamEvent(text="你好")
         assert len(events) == 2
         assert events[1].err is not None
@@ -397,7 +444,9 @@ async def test_cancellation_propagates_without_terminal_event_and_closes_respons
     events: list[StreamEvent] = []
 
     async def consume() -> None:
-        async for event in provider.stream(HISTORY, []):
+        async for event in provider.stream(
+            Request(messages=HISTORY, tools=[], system=System(stable=TEST_SYSTEM))
+        ):
             events.append(event)
 
     task = asyncio.create_task(consume())
@@ -426,7 +475,9 @@ async def test_closing_iterator_early_closes_response(protocol: ProtocolName) ->
         )
     )
     provider = provider_with_http(config(protocol), http)
-    iterator = provider.stream(HISTORY, [])
+    iterator = provider.stream(
+        Request(messages=HISTORY, tools=[], system=System(stable=TEST_SYSTEM))
+    )
     try:
         assert await anext(iterator) == StreamEvent(text="你好")
         await iterator.aclose()  # type: ignore[attr-defined]
@@ -446,7 +497,9 @@ async def test_provider_close_releases_active_response_and_client(protocol: Prot
         )
     )
     provider = provider_with_http(config(protocol), http)
-    iterator = provider.stream(HISTORY, [])
+    iterator = provider.stream(
+        Request(messages=HISTORY, tools=[], system=System(stable=TEST_SYSTEM))
+    )
     try:
         assert await anext(iterator) == StreamEvent(text="你好")
         await provider.aclose()
@@ -490,7 +543,12 @@ async def test_clean_eof_without_protocol_completion_is_an_error(protocol: Proto
     )
     provider = provider_with_http(config(protocol), http)
     try:
-        events = [event async for event in provider.stream(HISTORY, [])]
+        events = [
+            event
+            async for event in provider.stream(
+                Request(messages=HISTORY, tools=[], system=System(stable=TEST_SYSTEM))
+            )
+        ]
         assert events[0] == StreamEvent(text="你好")
         assert len(events) == 2
         assert events[1].err is not None
@@ -558,7 +616,12 @@ async def test_owned_client_sends_only_config_identity_and_no_ambient_headers(
     await client._client.aclose()
     client._client = httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
     try:
-        assert [event async for event in provider.stream(HISTORY, [])][-1] == StreamEvent(done=True)
+        assert [
+            event
+            async for event in provider.stream(
+                Request(messages=HISTORY, tools=[], system=System(stable=TEST_SYSTEM))
+            )
+        ][-1] == StreamEvent(done=True)
         assert len(requests) == 1
         headers = requests[0].headers
         assert "x-ambient" not in headers
@@ -593,7 +656,12 @@ async def test_explicitly_injected_client_keeps_deliberate_headers(
     http = httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
     provider = provider_with_http(config(protocol), http)
     try:
-        assert [event async for event in provider.stream(HISTORY, [])][-1] == StreamEvent(done=True)
+        assert [
+            event
+            async for event in provider.stream(
+                Request(messages=HISTORY, tools=[], system=System(stable=TEST_SYSTEM))
+            )
+        ][-1] == StreamEvent(done=True)
         assert requests[0].headers["x-injected"] == "kept"
     finally:
         await provider.aclose()
@@ -735,7 +803,16 @@ async def test_tool_definitions_and_complete_fragmented_call(protocol: ProtocolN
         config(protocol, thinking=True), httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
     )
     try:
-        events = [event async for event in provider.stream([Message("user", "读文件")], TOOLS)]
+        events = [
+            event
+            async for event in provider.stream(
+                Request(
+                    messages=[Message("user", "读文件")],
+                    tools=TOOLS,
+                    system=System(stable=TEST_SYSTEM),
+                )
+            )
+        ]
         assert events[0] == StreamEvent(text="正在读取")
         assert len(events) == (4 if protocol == "anthropic" else 3)
         assert events[1].tool_calls[0].id == "call-a"
@@ -820,7 +897,12 @@ async def test_tool_history_is_mapped_for_followup_with_thinking_disabled(
         config(protocol, thinking=True), httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
     )
     try:
-        assert [event async for event in provider.stream(history, [])][-1] == StreamEvent(done=True)
+        assert [
+            event
+            async for event in provider.stream(
+                Request(messages=history, tools=[], system=System(stable=TEST_SYSTEM))
+            )
+        ][-1] == StreamEvent(done=True)
         body = json.loads(requests[0].content)
         assert "tools" not in body
         assert "thinking" not in body
@@ -922,7 +1004,12 @@ async def test_openai_interleaved_id_name_arguments_fragments_are_sorted_by_inde
     )
     provider = provider_with_http(config("openai"), http)
     try:
-        assert [event async for event in provider.stream(HISTORY, TOOLS)] == [
+        assert [
+            event
+            async for event in provider.stream(
+                Request(messages=HISTORY, tools=TOOLS, system=System(stable=TEST_SYSTEM))
+            )
+        ] == [
             StreamEvent(
                 tool_calls=[
                     ToolCall("call-a", "read_file", '{"path":"a.txt"}'),
@@ -954,7 +1041,12 @@ async def test_invalid_tool_json_is_an_error_without_call_or_done(
     )
     provider = provider_with_http(config(protocol), http)
     try:
-        events = [event async for event in provider.stream(HISTORY, TOOLS)]
+        events = [
+            event
+            async for event in provider.stream(
+                Request(messages=HISTORY, tools=TOOLS, system=System(stable=TEST_SYSTEM))
+            )
+        ]
         assert events[0] == StreamEvent(text="正在读取")
         assert len(events) == 2
         assert events[-1].err is not None
@@ -977,7 +1069,12 @@ async def test_incomplete_tool_identity_is_rejected(protocol: ProtocolName, fiel
     )
     provider = provider_with_http(config(protocol), http)
     try:
-        events = [event async for event in provider.stream(HISTORY, TOOLS)]
+        events = [
+            event
+            async for event in provider.stream(
+                Request(messages=HISTORY, tools=TOOLS, system=System(stable=TEST_SYSTEM))
+            )
+        ]
         assert events[-1].err is not None
         assert not any(event.tool_calls or event.done for event in events)
         assert response.closed
@@ -1001,7 +1098,9 @@ async def test_tool_call_waits_for_protocol_completion_and_cancellation_closes_r
     events: list[StreamEvent] = []
 
     async def consume() -> None:
-        async for event in provider.stream(HISTORY, TOOLS):
+        async for event in provider.stream(
+            Request(messages=HISTORY, tools=TOOLS, system=System(stable=TEST_SYSTEM))
+        ):
             events.append(event)
 
     task = asyncio.create_task(consume())
@@ -1033,7 +1132,12 @@ async def test_valid_tool_arguments_without_terminal_sse_are_rejected(
     )
     provider = provider_with_http(config(protocol), http)
     try:
-        events = [event async for event in provider.stream(HISTORY, TOOLS)]
+        events = [
+            event
+            async for event in provider.stream(
+                Request(messages=HISTORY, tools=TOOLS, system=System(stable=TEST_SYSTEM))
+            )
+        ]
         assert events[-1].err is not None
         assert not any(event.tool_calls or event.done for event in events)
         assert response.closed
@@ -1072,7 +1176,12 @@ async def test_openai_empty_or_truncated_tool_turn_does_not_emit_calls(finish: s
     )
     provider = provider_with_http(config("openai"), http)
     try:
-        events = [event async for event in provider.stream(HISTORY, TOOLS)]
+        events = [
+            event
+            async for event in provider.stream(
+                Request(messages=HISTORY, tools=TOOLS, system=System(stable=TEST_SYSTEM))
+            )
+        ]
         assert len(events) == 1
         assert events[0].err is not None
         assert not any(event.tool_calls or event.done for event in events)
@@ -1099,7 +1208,12 @@ async def test_tool_batches_preserve_same_name_calls_but_reject_duplicate_ids(
     )
     provider = provider_with_http(config(protocol), http)
     try:
-        events = [event async for event in provider.stream(HISTORY, TOOLS)]
+        events = [
+            event
+            async for event in provider.stream(
+                Request(messages=HISTORY, tools=TOOLS, system=System(stable=TEST_SYSTEM))
+            )
+        ]
         if second_id == "call-a":
             assert events[-1].err is not None
             assert not any(event.tool_calls or event.done for event in events)
@@ -1130,9 +1244,129 @@ async def test_invalid_second_call_does_not_emit_first_valid_call(protocol: Prot
     )
     provider = provider_with_http(config(protocol), http)
     try:
-        events = [event async for event in provider.stream(HISTORY, TOOLS)]
+        events = [
+            event
+            async for event in provider.stream(
+                Request(messages=HISTORY, tools=TOOLS, system=System(stable=TEST_SYSTEM))
+            )
+        ]
         assert events[-1].err is not None
         assert not any(event.tool_calls or event.done for event in events)
         assert response.closed
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+async def test_reminder_is_sent_after_tool_results_without_mutating_request(
+    protocol: ProtocolName,
+) -> None:
+    from copy import deepcopy
+
+    requests: list[httpx2.Request] = []
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=ResponseStream(payload(protocol)),
+        )
+
+    req = Request(
+        messages=[
+            Message("user", "任务"),
+            Message("assistant", tool_calls=[ToolCall("call-a", "glob", "{}")]),
+            Message("tool", tool_results=[ToolResult("call-a", "结果")]),
+        ],
+        system=System(TEST_SYSTEM, "环境"),
+        reminder="临时提醒",
+    )
+    before = deepcopy(req)
+    provider = provider_with_http(
+        config(protocol), httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
+    )
+    try:
+        assert [event async for event in provider.stream(req)][-1] == StreamEvent(done=True)
+        messages = json.loads(requests[0].content)["messages"]
+        if protocol == "anthropic":
+            assert messages[-1]["content"] == [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call-a",
+                    "content": "结果",
+                    "is_error": False,
+                },
+                {"type": "text", "text": "临时提醒"},
+            ]
+        else:
+            assert messages[-2:] == [
+                {"role": "tool", "tool_call_id": "call-a", "content": "结果"},
+                {"role": "user", "content": "临时提醒"},
+            ]
+        assert req == before
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+@pytest.mark.parametrize("cached", [None, 17])
+async def test_sdk_stream_exposes_cache_usage(protocol: ProtocolName, cached: int | None) -> None:
+    chunks = payload(protocol)
+    if protocol == "anthropic":
+        chunks[0] = chunks[0].replace(
+            b'"input_tokens": 4, "output_tokens": 0',
+            json.dumps(
+                {
+                    "input_tokens": 4,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": cached,
+                    "cache_read_input_tokens": cached,
+                }
+            ).encode()[1:-1],
+        )
+        expected = Usage(4, 4, cached or 0, cached or 0)
+    else:
+        chunks[-1] = chunks[-1].replace(
+            b"data: [DONE]\n\n",
+            sse(
+                {
+                    "id": "chat-test",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "test-model",
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 11,
+                        "completion_tokens": 7,
+                        "total_tokens": 18,
+                        "prompt_tokens_details": {"cached_tokens": cached},
+                    },
+                }
+            )
+            + b"data: [DONE]\n\n",
+        )
+        expected = Usage(11, 7, 0, cached or 0)
+    provider = provider_with_http(
+        config(protocol),
+        httpx2.AsyncClient(
+            transport=httpx2.MockTransport(
+                lambda request: httpx2.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    stream=ResponseStream(chunks),
+                )
+            )
+        ),
+    )
+    try:
+        events = [
+            event
+            async for event in provider.stream(
+                Request(messages=HISTORY, system=System(TEST_SYSTEM))
+            )
+        ]
+        assert [event.usage for event in events if event.usage is not None] == [expected]
+        assert events[-1] == StreamEvent(done=True)
     finally:
         await provider.aclose()

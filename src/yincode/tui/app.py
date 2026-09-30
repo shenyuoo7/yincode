@@ -176,6 +176,8 @@ class YinCodeApp(App[None]):
             self.agent = Agent(
                 self.provider,
                 self._tool_registry,
+                __version__,
+                cwd=self.cwd,
                 redactor=self._redact,
                 secrets=tuple(cfg.api_key for cfg in self.providers),
             )

@@ -52,6 +52,26 @@ class Usage:
 
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_write: int = 0
+    cache_read: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class System:
+    """稳定指令与每次运行采集的环境分开承载。"""
+
+    stable: str = ""
+    environment: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class Request:
+    """模型请求；reminder 只进入请求副本，不写会话历史。"""
+
+    messages: list[Message] = field(default_factory=list)
+    tools: list[ToolDefinition] = field(default_factory=list)
+    system: System = field(default_factory=System)
+    reminder: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,9 +105,7 @@ class Provider(Protocol):
     @property
     def model(self) -> str: ...
 
-    def stream(
-        self, msgs: list[Message], tools: list[ToolDefinition], system_suffix: str = ""
-    ) -> AsyncIterator[StreamEvent]: ...
+    def stream(self, req: Request) -> AsyncIterator[StreamEvent]: ...
 
     async def aclose(self) -> None: ...
 

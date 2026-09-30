@@ -25,6 +25,7 @@ packages = ["src/yincode"]
 include = [
   "src/yincode/**",
   "tests/**",
+  "examples/smoke.py",
   "pyproject.toml",
   "uv.lock",
   ".gitignore",

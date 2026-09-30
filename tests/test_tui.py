@@ -14,10 +14,22 @@ from textual.widgets import OptionList, RichLog, Static, TextArea
 
 from yincode.agent import Mode
 from yincode.config import ProviderConfig
-from yincode.llm import Message, StreamEvent, ToolCall, ToolDefinition, Usage
-from yincode.prompt import EXECUTE_DIRECTIVE, PLAN_MODE_REMINDER, render_banner_text
+from yincode.llm import Message, Request, StreamEvent, ToolCall, ToolDefinition, Usage
+from yincode.prompt import EXECUTE_DIRECTIVE, build_system_prompt, plan_reminder, render_banner_text
 from yincode.tui import SessionState, YinCodeApp, view
 from yincode.tui.view import streaming_block
+
+
+@pytest.fixture(autouse=True)
+def deterministic_ui_environment(monkeypatch):
+    """界面测试隔离 Git 外调时延；真实采集由环境与 SDK 集成测试覆盖。"""
+    from yincode import prompt
+    from yincode.prompt.environment import Environment
+
+    async def gather(version, model, *, cwd=None):
+        return Environment(str(cwd), "win32", "2026-10-01", "", version, model)
+
+    monkeypatch.setattr(prompt, "gather_environment", gather)
 
 
 def test_crlf_tool_output_has_clean_lines_and_lone_carriage_is_visible():
@@ -36,18 +48,16 @@ class FakeProvider:
         self.events: asyncio.Queue[StreamEvent | Exception | None] = asyncio.Queue()
         self.requests: list[list[Message]] = []
         self.tool_requests: list[list[ToolDefinition]] = []
-        self.system_suffixes: list[str] = []
+        self.model_requests: list[Request] = []
         self.stream_closed = 0
         self.client_closed = 0
         self.cancelled = False
         self.close_error: Exception | None = None
 
-    async def stream(
-        self, msgs: list[Message], tools: list[ToolDefinition], system_suffix: str = ""
-    ) -> AsyncIterator[StreamEvent]:
-        self.requests.append(msgs)
-        self.tool_requests.append(tools)
-        self.system_suffixes.append(system_suffix)
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        self.requests.append(req.messages)
+        self.tool_requests.append(req.tools)
+        self.model_requests.append(req)
         try:
             while True:
                 event = await self.events.get()
@@ -117,7 +127,9 @@ async def test_plan_requires_a_completed_plan_before_do_starts_execution(tmp_pat
         assert fake.requests == [] and app.mode is Mode.PLAN
         await app.submit("制定方案")
         await pilot.pause()
-        assert fake.system_suffixes == [PLAN_MODE_REMINDER]
+        assert fake.model_requests[0].reminder == plan_reminder(True)
+        assert fake.model_requests[0].system.stable == build_system_prompt()
+        assert str(tmp_path) in fake.model_requests[0].system.environment
         assert {tool.name for tool in fake.tool_requests[0]} == {
             "read_file",
             "glob",
@@ -131,7 +143,8 @@ async def test_plan_requires_a_completed_plan_before_do_starts_execution(tmp_pat
         assert app.mode is Mode.NORMAL
         assert "PLAN" not in static_text(app, "#statusbar")
         assert app.conv.messages()[-1] == Message("user", EXECUTE_DIRECTIVE)
-        assert fake.system_suffixes[-1] == ""
+        assert fake.model_requests[-1].reminder == ""
+        assert fake.model_requests[-1].system.stable == fake.model_requests[0].system.stable
         assert len(fake.tool_requests[-1]) == 6
         await fake.events.put(StreamEvent(text="已执行"))
         await fake.events.put(StreamEvent(done=True))
@@ -441,10 +454,8 @@ async def test_cancelling_quit_propagates_instead_of_becoming_a_normal_exit(tmp_
             super().__init__(config)
             self.cleanup_started = asyncio.Event()
 
-        async def stream(
-            self, msgs: list[Message], tools: list[ToolDefinition], system_suffix: str = ""
-        ) -> AsyncIterator[StreamEvent]:
-            self.requests.append(msgs)
+        async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+            self.requests.append(req.messages)
             try:
                 await asyncio.Event().wait()
                 yield StreamEvent(done=True)

@@ -71,7 +71,13 @@ async def test_real_sdk_ui_failure_then_next_turn_has_valid_history(protocol, tm
         assert app.conv.messages()[-1].content == "你好世界"
         history = requests[1]["messages"]
         if protocol == "openai":
+            assert str(tmp_path) in history[0]["content"]
             history = history[1:]
+        else:
+            system = requests[1]["system"]
+            assert system[0]["cache_control"] == {"type": "ephemeral"}
+            assert "cache_control" not in system[1]
+            assert str(tmp_path) in system[1]["text"]
         assert [item["role"] for item in history] == ["user", "assistant", "user"]
         assert history[0]["content"] == "remember 42"
         assert history[-1]["content"] == "what number?"

@@ -12,9 +12,8 @@ from openai.types.chat import (
 )
 
 from yincode.config import ProviderConfig, redact
-from yincode.llm import Message, StreamEvent, ToolCall, ToolDefinition, Usage
+from yincode.llm import Request, StreamEvent, ToolCall, Usage
 from yincode.llm._json import object_from_json
-from yincode.prompt import SYSTEM_PROMPT
 
 
 def _check_call(call_id: str, name: str, raw: str) -> None:
@@ -25,12 +24,10 @@ def _check_call(call_id: str, name: str, raw: str) -> None:
     object_from_json(raw)
 
 
-def _to_openai_messages(
-    msgs: list[Message], system_suffix: str = ""
-) -> list[ChatCompletionMessageParam]:
-    system = SYSTEM_PROMPT + "\n\n" + system_suffix if system_suffix else SYSTEM_PROMPT
+def _to_openai_messages(req: Request) -> list[ChatCompletionMessageParam]:
+    system = "\n\n".join(part for part in (req.system.stable, req.system.environment) if part)
     messages: list[ChatCompletionMessageParam] = [{"role": "system", "content": system}]
-    for message in msgs:
+    for message in req.messages:
         if message.role == "tool":
             messages.extend(
                 {
@@ -59,6 +56,8 @@ def _to_openai_messages(
             )
         else:
             messages.append({"role": "assistant", "content": message.content})
+    if req.reminder:
+        messages.append({"role": "user", "content": req.reminder})
     return messages
 
 
@@ -93,16 +92,14 @@ class OpenAIProvider:
     def model(self) -> str:
         return self._cfg.model
 
-    async def stream(
-        self, msgs: list[Message], tools: list[ToolDefinition], system_suffix: str = ""
-    ) -> AsyncIterator[StreamEvent]:
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
         completed = False
         finish_reason: str | None = None
         call_buffers: dict[int, dict[str, str]] = {}
         calls: list[ToolCall] = []
         usage: Usage | None = None
         try:
-            messages = _to_openai_messages(msgs, system_suffix)
+            messages = _to_openai_messages(req)
             tool_params: list[ChatCompletionToolParam] | Omit = (
                 [
                     {
@@ -113,9 +110,9 @@ class OpenAIProvider:
                             "parameters": tool.input_schema,
                         },
                     }
-                    for tool in tools
+                    for tool in req.tools
                 ]
-                if tools
+                if req.tools
                 else omit
             )
             stream = await self._client.chat.completions.create(
@@ -133,6 +130,11 @@ class OpenAIProvider:
                             usage = Usage(
                                 input_tokens=chunk.usage.prompt_tokens,
                                 output_tokens=chunk.usage.completion_tokens,
+                                cache_read=(
+                                    chunk.usage.prompt_tokens_details.cached_tokens or 0
+                                    if chunk.usage.prompt_tokens_details is not None
+                                    else 0
+                                ),
                             )
                         if not chunk.choices:
                             continue
