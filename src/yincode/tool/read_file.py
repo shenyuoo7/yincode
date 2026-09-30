@@ -9,6 +9,7 @@ from .registry import READ_BYTES, READ_LINES, _FileTool, _string, _truncate, _ut
 
 class ReadFileTool(_FileTool):
     _name = "read_file"
+    read_only = True
     _description = "读取 UTF-8 文件并返回行号；最多 2000 行和 256 KiB，超出标注截断。"
     _parameters = {
         "type": "object",

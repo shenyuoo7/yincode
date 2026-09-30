@@ -21,6 +21,9 @@ class Conversation:
     def add_tool_results(self, results: list[ToolResult]) -> None:
         self._messages.append(Message("tool", tool_results=list(results)))
 
+    def last_role(self) -> str:
+        return self._messages[-1].role if self._messages else ""
+
     def messages(self) -> list[Message]:
         return [
             replace(m, tool_calls=list(m.tool_calls), tool_results=list(m.tool_results))

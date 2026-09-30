@@ -23,6 +23,9 @@ class Tool(Protocol):
     @property
     def parameters(self) -> dict[str, Any]: ...
 
+    @property
+    def read_only(self) -> bool: ...
+
     async def execute(self, args: str) -> Result: ...
 
 

@@ -155,6 +155,7 @@ class _WindowsJob:
 
 class BashTool(_FileTool):
     _name = "bash"
+    read_only = False
     _parameters = {
         "type": "object",
         "properties": {"command": {"type": "string"}},

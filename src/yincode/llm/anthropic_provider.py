@@ -17,13 +17,17 @@ from anthropic.types import (
 )
 
 from yincode.config import ProviderConfig, redact
-from yincode.llm import Message, StreamEvent, ToolCall, ToolDefinition
+from yincode.llm import Message, StreamEvent, ToolCall, ToolDefinition, Usage
 from yincode.llm._json import object_from_json
 from yincode.prompt import SYSTEM_PROMPT
 
 
 def _json_object(raw: str) -> dict[str, Any]:
     return object_from_json(raw)
+
+
+def _effective_system(suffix: str) -> str:
+    return SYSTEM_PROMPT + "\n\n" + suffix if suffix else SYSTEM_PROMPT
 
 
 def _check_identity(call_id: str, name: str) -> None:
@@ -92,10 +96,11 @@ class AnthropicProvider:
         return self._cfg.model
 
     async def stream(
-        self, msgs: list[Message], tools: list[ToolDefinition]
+        self, msgs: list[Message], tools: list[ToolDefinition], system_suffix: str = ""
     ) -> AsyncIterator[StreamEvent]:
         completed = False
         calls: list[ToolCall] = []
+        usage: Usage | None = None
         json_inputs: dict[int, str] = {}
         closed_tools: set[int] = set()
         try:
@@ -123,7 +128,7 @@ class AnthropicProvider:
             async with self._client.messages.stream(
                 model=self.model,
                 max_tokens=4096,
-                system=SYSTEM_PROMPT,
+                system=_effective_system(system_suffix),
                 messages=messages,
                 thinking=thinking,
                 tools=tool_params,
@@ -178,6 +183,10 @@ class AnthropicProvider:
                         raise RuntimeError("工具回复缺少完整调用")
                     if len({call.id for call in calls}) != len(calls):
                         raise RuntimeError("工具调用 id 重复，无法配对结果")
+                    usage = Usage(
+                        input_tokens=final_message.usage.input_tokens,
+                        output_tokens=final_message.usage.output_tokens,
+                    )
                 finally:
                     self._streams.discard(stream)
         except asyncio.CancelledError:
@@ -191,6 +200,8 @@ class AnthropicProvider:
         else:
             if calls:
                 yield StreamEvent(tool_calls=calls)
+            if usage is not None:
+                yield StreamEvent(usage=usage)
             yield StreamEvent(done=True)
 
     async def aclose(self) -> None:

@@ -25,6 +25,23 @@ def test_stream_event_rejects_conflicting_payloads():
         mod.StreamEvent(text="text", done=True)
     with pytest.raises(ValueError):
         mod.StreamEvent(done=True, err=ValueError("failure"))
+    assert mod.StreamEvent(usage=mod.Usage(3, 5)).usage.input_tokens == 3
+    with pytest.raises(ValueError):
+        mod.StreamEvent(usage=mod.Usage(1, 2), done=True)
+
+
+def test_last_role_tracks_conversation_tail():
+    from yincode.conversation import Conversation
+    from yincode.llm import ToolResult
+
+    conv = Conversation()
+    assert conv.last_role() == ""
+    conv.add_user("hello")
+    assert conv.last_role() == "user"
+    conv.add_tool_results([ToolResult("c1", "ok")])
+    assert conv.last_role() == "tool"
+    conv.add_assistant("done")
+    assert conv.last_role() == "assistant"
 
 
 def test_messages_cannot_be_mutated_through_snapshot():

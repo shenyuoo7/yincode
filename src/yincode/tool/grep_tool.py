@@ -16,6 +16,7 @@ _LINE_BYTES = 65_536
 
 class GrepTool(_FileTool):
     _name = "grep"
+    read_only = True
     _description = (
         "用 Python 正则搜索文本，返回 file:line:content；最多 100 条，超长行标注未完整搜索。"
     )

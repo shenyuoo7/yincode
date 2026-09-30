@@ -35,6 +35,7 @@ def _matches(path: str, pattern: str) -> bool:
 
 class GlobTool(_FileTool):
     _name = "glob"
+    read_only = True
     _description = "按 glob 模式查找文件；支持 ** 跨目录，排序后最多返回 100 条。"
     _parameters = {
         "type": "object",

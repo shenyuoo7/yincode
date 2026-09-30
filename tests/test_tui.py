@@ -12,9 +12,10 @@ from textual.containers import ScrollableContainer
 from textual.geometry import Size
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
+from yincode.agent import Mode
 from yincode.config import ProviderConfig
-from yincode.llm import Message, StreamEvent, ToolCall, ToolDefinition
-from yincode.prompt import render_banner_text
+from yincode.llm import Message, StreamEvent, ToolCall, ToolDefinition, Usage
+from yincode.prompt import EXECUTE_DIRECTIVE, PLAN_MODE_REMINDER, render_banner_text
 from yincode.tui import SessionState, YinCodeApp, view
 from yincode.tui.view import streaming_block
 
@@ -35,16 +36,18 @@ class FakeProvider:
         self.events: asyncio.Queue[StreamEvent | Exception | None] = asyncio.Queue()
         self.requests: list[list[Message]] = []
         self.tool_requests: list[list[ToolDefinition]] = []
+        self.system_suffixes: list[str] = []
         self.stream_closed = 0
         self.client_closed = 0
         self.cancelled = False
         self.close_error: Exception | None = None
 
     async def stream(
-        self, msgs: list[Message], tools: list[ToolDefinition]
+        self, msgs: list[Message], tools: list[ToolDefinition], system_suffix: str = ""
     ) -> AsyncIterator[StreamEvent]:
         self.requests.append(msgs)
         self.tool_requests.append(tools)
+        self.system_suffixes.append(system_suffix)
         try:
             while True:
                 event = await self.events.get()
@@ -99,6 +102,86 @@ def test_wait_indicator_animates_before_the_first_second_or_text() -> None:
     second = render([streaming_block("", 0.15)])
     assert "Imagining… (0s)" in first and "Imagining… (0s)" in second
     assert first != second
+
+
+@pytest.mark.asyncio
+async def test_plan_requires_a_completed_plan_before_do_starts_execution(tmp_path: Path) -> None:
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        await app.submit("/do")
+        assert fake.requests == [] and app.conv.messages() == []
+        await app.submit("/plan")
+        assert app.mode is Mode.PLAN
+        assert "PLAN" in static_text(app, "#statusbar")
+        await app.submit("/do")
+        assert fake.requests == [] and app.mode is Mode.PLAN
+        await app.submit("制定方案")
+        await pilot.pause()
+        assert fake.system_suffixes == [PLAN_MODE_REMINDER]
+        assert {tool.name for tool in fake.tool_requests[0]} == {
+            "read_file",
+            "glob",
+            "grep",
+        }
+        await fake.events.put(StreamEvent(text="先阅读，再修改"))
+        await fake.events.put(StreamEvent(done=True))
+        await wait_for_state(app, SessionState.IDLE)
+        await app.submit("/do")
+        await pilot.pause()
+        assert app.mode is Mode.NORMAL
+        assert "PLAN" not in static_text(app, "#statusbar")
+        assert app.conv.messages()[-1] == Message("user", EXECUTE_DIRECTIVE)
+        assert fake.system_suffixes[-1] == ""
+        assert len(fake.tool_requests[-1]) == 6
+        await fake.events.put(StreamEvent(text="已执行"))
+        await fake.events.put(StreamEvent(done=True))
+        await wait_for_state(app, SessionState.IDLE)
+
+
+@pytest.mark.asyncio
+async def test_usage_and_iteration_are_visible_and_accumulate_across_turns(tmp_path: Path) -> None:
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        await app.submit("第一轮")
+        await pilot.pause()
+        assert "第 1 轮" in static_text(app, "#streaming")
+        await fake.events.put(StreamEvent(usage=Usage(1234, 56)))
+        await fake.events.put(StreamEvent(text="回复"))
+        await pilot.pause()
+        assert "↑1.2k ↓56 tok" in static_text(app, "#statusbar")
+        await fake.events.put(StreamEvent(done=True))
+        await wait_for_state(app, SessionState.IDLE)
+        assert app.iter == 0 and app.usage_in == 1234 and app.usage_out == 56
+        await app.submit("第二轮")
+        await fake.events.put(StreamEvent(usage=Usage(10, 4)))
+        await fake.events.put(StreamEvent(text="完成"))
+        await fake.events.put(StreamEvent(done=True))
+        await wait_for_state(app, SessionState.IDLE)
+        assert app.usage_in == 1244 and app.usage_out == 60
+        assert "↑1.2k ↓60 tok" in static_text(app, "#statusbar")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["escape", "ctrl+c"])
+async def test_turn_cancel_returns_idle_and_next_turn_can_continue(
+    tmp_path: Path, key: str
+) -> None:
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        await app.submit("等待中")
+        await pilot.pause()
+        current_cancel = app.turn_cancel
+        assert current_cancel is not None
+        await pilot.press(key)
+        await wait_for_state(app, SessionState.IDLE)
+        assert current_cancel.is_set()
+        assert app.turn_cancel is None and app.is_running
+        assert app.conv.messages()[-1].role == "assistant"
+        await app.submit("继续")
+        await fake.events.put(StreamEvent(text="恢复成功"))
+        await fake.events.put(StreamEvent(done=True))
+        await wait_for_state(app, SessionState.IDLE)
+        assert app.conv.messages()[-1] == Message("assistant", "恢复成功")
 
 
 @pytest.mark.asyncio
@@ -172,7 +255,7 @@ async def test_stream_is_plain_text_timed_and_rejects_concurrent_turns(tmp_path:
         assert "**literal** [red]正文[/red]" in static_text(app, "#streaming")
         app.turn_start -= 2
         await pilot.pause(0.2)
-        assert "Imagining… (2s)" in static_text(app, "#streaming")
+        assert "Imagining… (2s · 第 1 轮)" in static_text(app, "#streaming")
         await app.submit("不应发送")
         assert app.conv.messages() == [Message("user", "问题")]
         assert len(fake.requests) == 1
@@ -262,7 +345,7 @@ async def test_unfinished_eof_becomes_error_without_hanging(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("method", ["exit", "ctrl+c", "teardown"])
+@pytest.mark.parametrize("method", ["exit", "teardown"])
 async def test_exit_awaits_stream_cancellation_and_client_close(
     tmp_path: Path, method: str
 ) -> None:
@@ -275,8 +358,6 @@ async def test_exit_awaits_stream_cancellation_and_client_close(
         if method == "exit":
             app.query_one("#input", TextArea).load_text("/exit")
             await pilot.press("enter")
-        elif method == "ctrl+c":
-            await pilot.press("ctrl+c")
     assert stream_task.done() and stream_task.cancelled()
     assert fake.cancelled and fake.stream_closed == 1
     assert fake.client_closed == 1
@@ -361,7 +442,7 @@ async def test_cancelling_quit_propagates_instead_of_becoming_a_normal_exit(tmp_
             self.cleanup_started = asyncio.Event()
 
         async def stream(
-            self, msgs: list[Message], tools: list[ToolDefinition]
+            self, msgs: list[Message], tools: list[ToolDefinition], system_suffix: str = ""
         ) -> AsyncIterator[StreamEvent]:
             self.requests.append(msgs)
             try:
@@ -653,6 +734,7 @@ class WaitingTool:
     name = "read_file"
     description = "读取内存夹具"
     parameters = {"type": "object", "properties": {"path": {"type": "string"}}}
+    read_only = True
 
     def __init__(self, result: str | None = None, is_error: bool = False) -> None:
         self.started = asyncio.Event()
@@ -670,6 +752,41 @@ class WaitingTool:
             return Result(self.result or f"已读取 {json.loads(args)['path']}", self.is_error)
         finally:
             self.cleaned = True
+
+
+@pytest.mark.asyncio
+async def test_concurrent_tools_have_two_running_rows_then_ordered_history(tmp_path: Path) -> None:
+    from yincode.tool import Registry
+
+    tool = WaitingTool()
+    registry = Registry()
+    registry.register(tool)
+    fake = FakeProvider(cfg())
+    app = YinCodeApp([cfg()], provider_factory=lambda _: fake, cwd=tmp_path, registry=registry)
+    async with app.run_test() as pilot:
+        await app.submit("读取两个文件")
+        await fake.events.put(
+            StreamEvent(
+                tool_calls=[
+                    ToolCall("first", "read_file", '{"path":"one.txt"}'),
+                    ToolCall("second", "read_file", '{"path":"two.txt"}'),
+                ]
+            )
+        )
+        await fake.events.put(StreamEvent(done=True))
+        await asyncio.wait_for(tool.started.wait(), 2)
+        await pilot.pause()
+        dynamic = static_text(app, "#streaming")
+        assert dynamic.count("Running…") == 2
+        assert dynamic.index("one.txt") < dynamic.index("two.txt")
+        assert [display.tool_call_id for display in app.cur_tools] == ["first", "second"]
+        tool.release.set()
+        await fake.events.put(StreamEvent(text="已完成"))
+        await fake.events.put(StreamEvent(done=True))
+        await wait_for_state(app, SessionState.IDLE)
+        history = render(app.transcript)
+        assert history.index("one.txt") < history.index("two.txt") < history.index("已完成")
+        assert app.cur_tools == []
 
 
 @pytest.mark.asyncio
@@ -702,7 +819,7 @@ async def test_slow_tool_keeps_input_and_running_timer_responsive(tmp_path: Path
         await fake.events.put(StreamEvent(done=True))
         await wait_for_state(app, SessionState.IDLE)
         assert app.query_one("#input", TextArea).text == "草稿续"
-        assert app._cur_tool is None
+        assert app.cur_tools == []
         assert tool.cleaned
 
 
@@ -819,7 +936,7 @@ async def test_quit_cancels_active_tool_and_pairs_the_entire_call_batch(tmp_path
     registry.register(tool)
     fake = FakeProvider(cfg())
     app = YinCodeApp([cfg()], provider_factory=lambda _: fake, cwd=tmp_path, registry=registry)
-    async with app.run_test() as pilot:
+    async with app.run_test():
         await app.submit("慢工具")
         await fake.events.put(
             StreamEvent(
@@ -832,7 +949,7 @@ async def test_quit_cancels_active_tool_and_pairs_the_entire_call_batch(tmp_path
         await fake.events.put(StreamEvent(done=True))
         await asyncio.wait_for(tool.started.wait(), 2)
         task = app._stream_task
-        await pilot.press("ctrl+c")
+        await app.action_quit()
     assert task is not None and task.done() and task.cancelled()
     assert tool.cleaned and fake.stream_closed == 1 and fake.client_closed == 1
     messages = app.conv.messages()

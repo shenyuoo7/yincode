@@ -8,7 +8,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import cast
 
-from rich.console import RenderableType
+from rich.console import Group, RenderableType
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
@@ -19,17 +19,18 @@ from textual.timer import Timer
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
 from yincode import __version__
-from yincode.agent import Agent, Phase, ToolEvent
+from yincode.agent import Agent, Mode, Phase, ToolEvent
 from yincode.config import ProviderConfig, redact
 from yincode.conversation import Conversation
 from yincode.llm import Provider, new_provider
-from yincode.prompt import render_banner_text
+from yincode.prompt import EXECUTE_DIRECTIVE, render_banner_text
 from yincode.tool import Registry, new_default_registry
 
 from .select import provider_options
 from .stream import consume_stream
 from .view import (
     error_block,
+    notice_block,
     render_markdown,
     status_bar,
     streaming_block,
@@ -97,7 +98,10 @@ class YinCodeApp(App[None]):
     }
     #statusbar { width: 1fr; height: auto; min-height: 1; max-height: 2; }
     """
-    BINDINGS = [Binding("ctrl+c", "quit", "退出", show=False, priority=True)]
+    BINDINGS = [
+        Binding("ctrl+c", "cancel_or_quit", "取消/退出", show=False, priority=True),
+        Binding("escape", "cancel_turn", "取消本轮", show=False, priority=True),
+    ]
 
     def __init__(
         self,
@@ -120,9 +124,14 @@ class YinCodeApp(App[None]):
         self.provider: Provider | None = None
         self.agent: Agent | None = None
         self.conv = Conversation()
+        self.mode = Mode.NORMAL
+        self._has_plan = False
+        self.iter = 0
+        self.usage_in = 0
+        self.usage_out = 0
         self.cur_reply = ""
-        self._cur_tool: ToolDisplay | None = None
-        self._tool_displays: dict[str, ToolDisplay] = {}
+        self.cur_tools: list[ToolDisplay] = []
+        self.turn_cancel: asyncio.Event | None = None
         self.turn_start = 0.0
         self._stream_task: asyncio.Task[None] | None = None
         self._timer: Timer | None = None
@@ -185,9 +194,7 @@ class YinCodeApp(App[None]):
         self.query_one("#providers").display = False
         self.query_one("#log").display = True
         self.query_one("#input-wrapper").display = True
-        self.query_one("#statusbar", Static).update(
-            status_bar(self.provider.name, self.provider.model)
-        )
+        self._refresh_status()
         self.query_one("#input", MessageInput).focus()
         self.call_after_refresh(self._redraw_history)
 
@@ -199,15 +206,36 @@ class YinCodeApp(App[None]):
         event.text_area.styles.height = min(7, event.text_area.document.line_count + 2)
 
     async def submit(self, text: str) -> None:
-        if text.strip() == "/exit":
+        command = text.strip()
+        if command == "/exit":
             await self.action_quit()
             return
-        if not text.strip() or self.state is not SessionState.IDLE or self._resources_closing:
+        if not command or self.state is not SessionState.IDLE or self._resources_closing:
             return
-        self.conv.add_user(text)
+        if command == "/plan":
+            self.mode = Mode.PLAN
+            self._has_plan = False
+            self.query_one("#input", MessageInput).clear()
+            self._append_history(notice_block("已进入计划模式（只读工具）"))
+            self._refresh_status()
+            return
+        if command == "/do":
+            if not self._has_plan:
+                self.query_one("#input", MessageInput).clear()
+                self._append_history(notice_block("请先在 /plan 模式中生成计划"))
+                return
+            self.mode = Mode.NORMAL
+            self._has_plan = False
+            self.conv.add_user(EXECUTE_DIRECTIVE)
+        else:
+            self.conv.add_user(text)
         self._append_history(user_block(text))
         self.query_one("#input", MessageInput).clear()
         self.cur_reply = ""
+        self.cur_tools.clear()
+        self.iter = 0
+        self.turn_cancel = asyncio.Event()
+        self._refresh_status()
         self.turn_start = time.monotonic()
         self.state = SessionState.STREAMING
         self.query_one("#streaming-panel").display = True
@@ -235,10 +263,13 @@ class YinCodeApp(App[None]):
             self._pending_stream_follow = previous_scroll
         streaming = self.query_one("#streaming", Static)
         elapsed = time.monotonic() - self.turn_start
-        if self._cur_tool is not None:
-            block = tool_streaming_block(self._cur_tool.name, self._cur_tool.args, elapsed)
+        block: RenderableType
+        if self.cur_tools:
+            block = Group(
+                *(tool_streaming_block(tool.name, tool.args, elapsed) for tool in self.cur_tools)
+            )
         else:
-            block = streaming_block(self.cur_reply, elapsed)
+            block = streaming_block(self.cur_reply, elapsed, self.iter)
         streaming.update(block)
 
     def _handle_tool_event(self, event: ToolEvent) -> None:
@@ -249,18 +280,19 @@ class YinCodeApp(App[None]):
             display = ToolDisplay(
                 event.tool_call_id, self._redact(event.name), self._redact(event.args)
             )
-            self._tool_displays[event.tool_call_id] = display
-            self._cur_tool = display
+            self.cur_tools.append(display)
         else:
-            finished_display = self._tool_displays.pop(event.tool_call_id, None)
+            finished_display = next(
+                (tool for tool in self.cur_tools if tool.tool_call_id == event.tool_call_id), None
+            )
             if finished_display is None:
                 finished_display = ToolDisplay(
                     event.tool_call_id, self._redact(event.name), self._redact(event.args)
                 )
+            else:
+                self.cur_tools.remove(finished_display)
             self._append_history(tool_line(finished_display.name, finished_display.args))
             self._append_history(tool_result_summary(self._redact(event.result), event.is_error))
-            if self._cur_tool is not None and self._cur_tool.tool_call_id == event.tool_call_id:
-                self._cur_tool = None
         self._pending_stream_follow = None
         self._refresh_streaming_view(follow_output=True)
 
@@ -290,6 +322,12 @@ class YinCodeApp(App[None]):
         panel.scroll_end(animate=False, immediate=True, x_axis=False)
 
     def _finish_with_assistant(self, reply: str) -> None:
+        if (
+            self.mode is Mode.PLAN
+            and reply.strip()
+            and not (self.turn_cancel is not None and self.turn_cancel.is_set())
+        ):
+            self._has_plan = True
         self._append_history(
             render_markdown(self._redact(reply), time.monotonic() - self.turn_start)
         )
@@ -305,8 +343,10 @@ class YinCodeApp(App[None]):
         self._pending_stream_follow = None
         self.state = SessionState.IDLE
         self.cur_reply = ""
-        self._cur_tool = None
-        self._tool_displays.clear()
+        self.cur_tools.clear()
+        self.iter = 0
+        self.turn_cancel = None
+        self._stream_task = None
         self.query_one("#streaming", Static).update("")
         self.query_one("#streaming-panel").display = False
         self.query_one("#input", MessageInput).focus()
@@ -315,6 +355,18 @@ class YinCodeApp(App[None]):
         if self._timer is not None:
             self._timer.stop()
             self._timer = None
+
+    def _refresh_status(self) -> None:
+        if self.provider is not None:
+            self.query_one("#statusbar", Static).update(
+                status_bar(
+                    self.provider.name,
+                    self.provider.model,
+                    plan=self.mode is Mode.PLAN,
+                    usage_in=self.usage_in,
+                    usage_out=self.usage_out,
+                )
+            )
 
     def _append_history(self, block: RenderableType) -> None:
         self.transcript.append(block)
@@ -360,8 +412,8 @@ class YinCodeApp(App[None]):
                         raise
                 finally:
                     self._stream_task = None
-            self._cur_tool = None
-            self._tool_displays.clear()
+            self.cur_tools.clear()
+            self.turn_cancel = None
             if self.provider is not None:
                 try:
                     await self.provider.aclose()
@@ -375,6 +427,16 @@ class YinCodeApp(App[None]):
     async def action_quit(self) -> None:
         await self._close_resources()
         self.exit()
+
+    async def action_cancel_or_quit(self) -> None:
+        if self.state is SessionState.STREAMING:
+            self.action_cancel_turn()
+        else:
+            await self.action_quit()
+
+    def action_cancel_turn(self) -> None:
+        if self.state is SessionState.STREAMING and self.turn_cancel is not None:
+            self.turn_cancel.set()
 
     async def on_unmount(self) -> None:
         await self._close_resources()

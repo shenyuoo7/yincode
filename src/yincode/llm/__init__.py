@@ -47,15 +47,35 @@ class Message:
 
 
 @dataclass(frozen=True, slots=True)
+class Usage:
+    """单次模型请求的输入与输出 token 数。"""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class StreamEvent:
     text: str = ""
     done: bool = False
     err: Exception | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
+    usage: Usage | None = None
 
     def __post_init__(self) -> None:
-        if sum((bool(self.text), self.done, self.err is not None, bool(self.tool_calls))) > 1:
-            raise ValueError("流事件只能包含正文、工具调用、完成或错误中的一种")
+        if (
+            sum(
+                (
+                    bool(self.text),
+                    self.done,
+                    self.err is not None,
+                    bool(self.tool_calls),
+                    self.usage is not None,
+                )
+            )
+            > 1
+        ):
+            raise ValueError("流事件只能包含正文、工具调用、用量、完成或错误中的一种")
 
 
 class Provider(Protocol):
@@ -66,7 +86,7 @@ class Provider(Protocol):
     def model(self) -> str: ...
 
     def stream(
-        self, msgs: list[Message], tools: list[ToolDefinition]
+        self, msgs: list[Message], tools: list[ToolDefinition], system_suffix: str = ""
     ) -> AsyncIterator[StreamEvent]: ...
 
     async def aclose(self) -> None: ...

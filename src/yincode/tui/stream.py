@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 
 from yincode.agent import Event
 
+from .view import notice_block
+
 if TYPE_CHECKING:
     from .app import YinCodeApp
 
@@ -16,20 +18,29 @@ async def consume_stream(app: "YinCodeApp") -> None:
     completed = False
     try:
         assert app.agent is not None
-        iterator = app.agent.run(app.conv)
+        iterator = app.agent.run(app.conv, app.mode, app.turn_cancel)
         async for event in iterator:
             if event.err is not None:
                 error = event.err
+                break
+            if event.tool is not None:
+                app._handle_tool_event(event.tool)
+            if event.usage is not None:
+                app.usage_in += event.usage.input_tokens
+                app.usage_out += event.usage.output_tokens
+                app._refresh_status()
+            if event.notice:
+                app._append_history(notice_block(app._redact(event.notice)))
+            if event.iter > 0:
+                app.iter = event.iter
+                app._refresh_streaming_view()
+            if event.done:
+                completed = True
                 break
             if event.text:
                 # 分片可能把密钥拆开；对累积正文再脱敏，保护动态区和完成块。
                 app.cur_reply = app._redact(app.cur_reply + event.text)
                 app._refresh_streaming_view(follow_output=True)
-            if event.tool is not None:
-                app._handle_tool_event(event.tool)
-            if event.done:
-                completed = True
-                break
     except asyncio.CancelledError:
         raise
     except Exception as exc:

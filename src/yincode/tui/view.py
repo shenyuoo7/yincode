@@ -37,10 +37,15 @@ def error_block(message: str, elapsed: float | None = None) -> Text:
     return Text("● " + _visible_text(message) + suffix, style="bold red")
 
 
-def streaming_block(reply: str, elapsed: float) -> Text:
+def notice_block(message: str) -> Text:
+    return Text("● " + _visible_text(message), style="dim")
+
+
+def streaming_block(reply: str, elapsed: float, iteration: int = 0) -> Text:
     text = Text("● " + _visible_text(reply) + "\n" if reply else "")
     frame = "|/-\\"[int(elapsed * 10) % 4]
-    text.append(f"Imagining… ({int(elapsed)}s) {frame}", style="dim")
+    progress = f" · 第 {iteration} 轮" if iteration > 0 else ""
+    text.append(f"Imagining… ({int(elapsed)}s{progress}) {frame}", style="dim")
     return text
 
 
@@ -78,9 +83,26 @@ def tool_streaming_block(name: str, args: str, elapsed: float) -> Text:
     return text
 
 
-def status_bar(name: str, model: str) -> Table:
+def _compact_tokens(count: int) -> str:
+    if count < 1000:
+        return str(count)
+    if count < 10000:
+        return f"{count / 1000:.1f}k"
+    if count < 1000000:
+        return f"{count // 1000}k"
+    return f"{count / 1000000:.1f}m"
+
+
+def status_bar(
+    name: str, model: str, *, plan: bool = False, usage_in: int = 0, usage_out: int = 0
+) -> Table:
     table = Table.grid(expand=True)
-    table.add_column(ratio=1, overflow="fold")
-    table.add_column(justify="right", overflow="fold")
-    table.add_row(Text(_visible_text(name)), Text(_visible_text(model)))
+    table.add_column(ratio=1, overflow="ellipsis", no_wrap=True)
+    table.add_column(justify="right", overflow="ellipsis", no_wrap=True)
+    provider = Text(_visible_text(name))
+    if plan:
+        provider.append(" PLAN", style="bold yellow")
+    right = Text(_visible_text(model))
+    right.append(f" ↑{_compact_tokens(usage_in)} ↓{_compact_tokens(usage_out)} tok", style="dim")
+    table.add_row(provider, right)
     return table

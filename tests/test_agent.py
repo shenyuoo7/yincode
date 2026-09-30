@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from yincode.conversation import Conversation
-from yincode.llm import Message, StreamEvent, ToolCall, ToolDefinition
+from yincode.llm import Message, StreamEvent, ToolCall, ToolDefinition, Usage
 
 
 class ScriptProvider:
@@ -16,14 +16,16 @@ class ScriptProvider:
         self.scripts = scripts
         self.requests: list[list[Message]] = []
         self.definitions: list[list[ToolDefinition]] = []
+        self.suffixes: list[str] = []
         self.closed = 0
 
     async def stream(
-        self, msgs: list[Message], tools: list[ToolDefinition]
+        self, msgs: list[Message], tools: list[ToolDefinition], system_suffix: str = ""
     ) -> AsyncIterator[StreamEvent]:
         index = len(self.requests)
         self.requests.append(msgs)
         self.definitions.append(tools)
+        self.suffixes.append(system_suffix)
         try:
             for event in self.scripts[index]:
                 yield event
@@ -65,7 +67,7 @@ async def test_read_result_is_carried_into_continuation(tmp_path: Path):
     assert events[-1].done
 
 
-async def test_second_tool_batch_is_not_executed_or_saved(tmp_path: Path):
+async def test_second_tool_batch_is_executed_without_user_prompt(tmp_path: Path):
     from yincode.agent import Agent
     from yincode.tool import new_default_registry
 
@@ -75,16 +77,17 @@ async def test_second_tool_batch_is_not_executed_or_saved(tmp_path: Path):
         [
             [StreamEvent(tool_calls=[first]), StreamEvent(done=True)],
             [StreamEvent(tool_calls=[second]), StreamEvent(done=True)],
+            [StreamEvent(text="done"), StreamEvent(done=True)],
         ]
     )
     conv = conversation()
     events = [e async for e in Agent(provider, new_default_registry(tmp_path)).run(conv)]
     assert (tmp_path / "one.txt").read_text() == "first"
-    assert not (tmp_path / "two.txt").exists()
-    assert "上限" in conv.messages()[-1].content
-    assert "上限" in "".join(e.text for e in events)
-    assert all(c.id != "c2" for m in conv.messages() for c in m.tool_calls)
-    assert len(provider.requests) == 2
+    assert (tmp_path / "two.txt").read_text() == "second"
+    assert conv.messages()[-1].content == "done"
+    assert [c.id for m in conv.messages() for c in m.tool_calls] == ["c1", "c2"]
+    assert len(provider.requests) == 3
+    assert [e.iter for e in events if e.iter] == [1, 2, 3]
 
 
 @pytest.mark.parametrize("continuation", [False, True])
@@ -138,6 +141,7 @@ async def test_cancellation_pairs_whole_batch_and_waits_for_tool_cleanup():
         name = "block"
         description = "blocks"
         parameters = {"type": "object", "properties": {}}
+        read_only = False
 
         def __init__(self):
             self.started = asyncio.Event()
@@ -182,6 +186,8 @@ async def test_aclose_at_start_event_pairs_batch_without_executing(tmp_path: Pat
     provider = ScriptProvider([[StreamEvent(tool_calls=[call]), StreamEvent(done=True)]])
     conv = conversation()
     iterator = Agent(provider, new_default_registry(tmp_path)).run(conv)
+    event = await anext(iterator)
+    assert event.iter == 1
     event = await anext(iterator)
     assert event.tool.phase is Phase.START
     await iterator.aclose()
@@ -240,3 +246,274 @@ async def test_empty_continuation_produces_visible_nonempty_tail():
     assert conv.messages()[-1].content
     assert conv.messages()[-1].content == "".join(e.text for e in events)
     assert events[-1].done
+
+
+async def test_plan_mode_filters_and_blocks_malicious_write(tmp_path: Path):
+    from yincode.agent import Agent, Mode
+    from yincode.prompt import PLAN_MODE_REMINDER
+    from yincode.tool import new_default_registry
+
+    call = ToolCall("evil", "write_file", '{"path":"plan.txt","content":"bad"}')
+    provider = ScriptProvider(
+        [
+            [StreamEvent(tool_calls=[call]), StreamEvent(done=True)],
+            [StreamEvent(text="plan only"), StreamEvent(done=True)],
+        ]
+    )
+    conv = conversation()
+    events = [e async for e in Agent(provider, new_default_registry(tmp_path)).run(conv, Mode.PLAN)]
+    assert provider.suffixes == [PLAN_MODE_REMINDER, PLAN_MODE_REMINDER]
+    assert all(
+        {tool.name for tool in defs} == {"read_file", "glob", "grep"}
+        for defs in provider.definitions
+    )
+    assert not (tmp_path / "plan.txt").exists()
+    assert conv.messages()[2].tool_results[0].is_error
+    assert events[-1].done
+
+
+async def test_usage_events_and_unknown_tool_limit():
+    from yincode.agent import MAX_UNKNOWN_RUN, NOTICE_UNKNOWN_TOOLS, Agent
+    from yincode.tool import Registry
+
+    provider = ScriptProvider(
+        [
+            [
+                StreamEvent(tool_calls=[ToolCall(f"c{i}", "missing", "{}")]),
+                StreamEvent(usage=Usage(i + 1, 2)),
+                StreamEvent(done=True),
+            ]
+            for i in range(MAX_UNKNOWN_RUN)
+        ]
+    )
+    conv = conversation()
+    events = [e async for e in Agent(provider, Registry()).run(conv)]
+    assert len(provider.requests) == MAX_UNKNOWN_RUN
+    assert [e.usage for e in events if e.usage] == [Usage(i + 1, 2) for i in range(MAX_UNKNOWN_RUN)]
+    assert [e.notice for e in events if e.notice] == [NOTICE_UNKNOWN_TOOLS]
+    assert conv.last_role() == "assistant"
+    assert all(m.tool_results for m in conv.messages() if m.role == "tool")
+
+
+async def test_cancel_while_provider_is_silent_closes_stream():
+    from yincode.agent import NOTICE_CANCELLED, Agent
+    from yincode.tool import Registry
+
+    class SilentProvider(ScriptProvider):
+        def __init__(self):
+            super().__init__([])
+            self.started = asyncio.Event()
+            self.closed_stream = asyncio.Event()
+
+        async def stream(self, msgs, tools, system_suffix=""):
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+                yield StreamEvent(done=True)
+            finally:
+                self.closed_stream.set()
+
+    provider = SilentProvider()
+    conv = conversation()
+    cancel = asyncio.Event()
+    task = asyncio.create_task(collect(Agent(provider, Registry()).run(conv, cancel=cancel)))
+    await asyncio.wait_for(provider.started.wait(), 2)
+    cancel.set()
+    events = await asyncio.wait_for(task, 2)
+    assert provider.closed_stream.is_set()
+    assert [e.notice for e in events if e.notice] == [NOTICE_CANCELLED]
+    assert events[-1].done
+    assert conv.last_role() == "assistant"
+
+
+async def collect(iterator):
+    return [event async for event in iterator]
+
+
+async def test_consecutive_read_only_calls_overlap_before_write():
+    from yincode.agent import Agent, Phase
+    from yincode.tool import Registry, Result
+
+    class Probe:
+        description = "probe"
+        parameters = {"type": "object", "properties": {}}
+
+        def __init__(self, name: str, read_only: bool):
+            self.name = name
+            self.read_only = read_only
+            self.active = 0
+            self.peak = 0
+            self.completed = 0
+            self.write_after_reads = False
+            self.both_started = asyncio.Event()
+
+        async def execute(self, args: str) -> Result:
+            if not self.read_only:
+                self.write_after_reads = reader.completed == 2
+                return Result("written")
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            if self.active == 2:
+                self.both_started.set()
+            await asyncio.wait_for(self.both_started.wait(), 2)
+            self.active -= 1
+            self.completed += 1
+            return Result(args)
+
+    reader = Probe("reader", True)
+    writer = Probe("writer", False)
+    registry = Registry()
+    registry.register(reader)
+    registry.register(writer)
+    calls = [
+        ToolCall("r1", "reader", "{}"),
+        ToolCall("r2", "reader", "{}"),
+        ToolCall("w1", "writer", "{}"),
+    ]
+    provider = ScriptProvider(
+        [
+            [StreamEvent(tool_calls=calls), StreamEvent(done=True)],
+            [StreamEvent(text="done"), StreamEvent(done=True)],
+        ]
+    )
+    conv = conversation()
+    events = await collect(Agent(provider, registry).run(conv))
+    assert reader.peak == 2
+    assert writer.write_after_reads
+    assert [result.tool_call_id for result in conv.messages()[2].tool_results] == ["r1", "r2", "w1"]
+    assert [event.tool.phase for event in events if event.tool] == [Phase.START] * 3 + [
+        Phase.END
+    ] * 3
+
+
+async def test_max_iterations_and_unknown_counter_reset():
+    from yincode.agent import MAX_ITERATIONS, NOTICE_MAX_ITER, Agent
+    from yincode.tool import Registry
+
+    provider = ScriptProvider(
+        [
+            [StreamEvent(tool_calls=[ToolCall(f"c{i}", "missing", "{}")]), StreamEvent(done=True)]
+            for i in range(MAX_ITERATIONS)
+        ]
+    )
+    # 一个已注册工具夹在未知工具之间，使未知计数归零，但总轮数仍应受上限控制。
+    from yincode.tool import Result
+
+    class Known:
+        name = "known"
+        description = "known"
+        parameters = {"type": "object", "properties": {}}
+        read_only = True
+
+        async def execute(self, args: str) -> Result:
+            return Result("ok")
+
+    registry = Registry()
+    registry.register(Known())
+    for index in range(0, MAX_ITERATIONS, 3):
+        provider.scripts[index] = [
+            StreamEvent(tool_calls=[ToolCall(f"c{index}", "known", "{}")]),
+            StreamEvent(done=True),
+        ]
+    conv = conversation()
+    events = await collect(Agent(provider, registry).run(conv))
+    assert len(provider.requests) == MAX_ITERATIONS
+    assert [e.notice for e in events if e.notice] == [NOTICE_MAX_ITER]
+    assert conv.last_role() == "assistant"
+
+
+async def test_cancel_event_during_tool_pairs_results():
+    from yincode.agent import NOTICE_CANCELLED, Agent
+    from yincode.tool import Registry, Result
+
+    class BlockingTool:
+        name = "block"
+        description = "block"
+        parameters = {"type": "object", "properties": {}}
+        read_only = True
+
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.cleaned = asyncio.Event()
+
+        async def execute(self, args: str) -> Result:
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cleaned.set()
+            return Result("never")
+
+    blocker = BlockingTool()
+    registry = Registry()
+    registry.register(blocker)
+    provider = ScriptProvider(
+        [[StreamEvent(tool_calls=[ToolCall("c1", "block", "{}")]), StreamEvent(done=True)]]
+    )
+    conv = conversation()
+    cancel = asyncio.Event()
+    task = asyncio.create_task(collect(Agent(provider, registry).run(conv, cancel=cancel)))
+    await asyncio.wait_for(blocker.started.wait(), 2)
+    cancel.set()
+    events = await asyncio.wait_for(task, 2)
+    assert blocker.cleaned.is_set()
+    assert conv.messages()[2].tool_results[0].is_error
+    assert conv.last_role() == "assistant"
+    assert [e.notice for e in events if e.notice] == [NOTICE_CANCELLED]
+
+
+async def test_cancel_keeps_completed_result_in_read_only_batch():
+    from yincode.agent import Agent
+    from yincode.tool import Registry, Result
+
+    class MixedSpeedTool:
+        name = "probe"
+        description = "probe"
+        parameters = {"type": "object", "properties": {"kind": {"type": "string"}}}
+        read_only = True
+
+        def __init__(self):
+            self.slow_started = asyncio.Event()
+            self.fast_done = asyncio.Event()
+            self.slow_cleaned = asyncio.Event()
+
+        async def execute(self, args: str) -> Result:
+            if "fast" in args:
+                await self.slow_started.wait()
+                self.fast_done.set()
+                return Result("fast result")
+            self.slow_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.slow_cleaned.set()
+            return Result("never")
+
+    tool = MixedSpeedTool()
+    registry = Registry()
+    registry.register(tool)
+    provider = ScriptProvider(
+        [
+            [
+                StreamEvent(
+                    tool_calls=[
+                        ToolCall("fast", "probe", '{"kind":"fast"}'),
+                        ToolCall("slow", "probe", '{"kind":"slow"}'),
+                    ]
+                ),
+                StreamEvent(done=True),
+            ]
+        ]
+    )
+    conv = conversation()
+    cancel = asyncio.Event()
+    task = asyncio.create_task(collect(Agent(provider, registry).run(conv, cancel=cancel)))
+    await asyncio.wait_for(tool.fast_done.wait(), 2)
+    cancel.set()
+    await asyncio.wait_for(task, 2)
+    assert tool.slow_cleaned.is_set()
+    results = conv.messages()[2].tool_results
+    assert [(result.tool_call_id, result.content, result.is_error) for result in results] == [
+        ("fast", "fast result", False),
+        ("slow", "工具执行已取消，未完成。", True),
+    ]

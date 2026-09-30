@@ -58,6 +58,45 @@ def test_registry_definitions_and_duplicate_registration(tmp_path: Path):
         registry.register(registry.get("read_file"))
 
 
+def test_registry_read_only_definitions_preserve_registration_order(tmp_path: Path):
+    registry = make_registry(tmp_path)
+    expected = ["read_file", "glob", "grep"]
+
+    assert [item.name for item in registry.read_only_definitions()] == expected
+    assert [registry.get(name).read_only for name in expected] == [True, True, True]
+    assert [registry.get(name).read_only for name in ["write_file", "edit_file", "bash"]] == [
+        False,
+        False,
+        False,
+    ]
+    assert [name for name in expected if registry.is_read_only(name)] == expected
+    assert all(
+        not registry.is_read_only(name) for name in ["write_file", "edit_file", "bash", "missing"]
+    )
+
+
+async def test_registry_allowed_names_rejects_write_before_it_runs(tmp_path: Path):
+    registry = make_registry(tmp_path)
+    allowed_names = {"read_file", "glob", "grep"}
+    target = tmp_path / "plan-denied.txt"
+
+    result = await registry.execute(
+        "write_file",
+        args(path=target.name, content="must not write"),
+        allowed_names=allowed_names,
+    )
+
+    assert result.is_error
+    assert "write_file" in result.content
+    assert not target.exists()
+    target.write_text("readable", encoding="utf-8")
+    permitted = await registry.execute(
+        "read_file", args(path=target.name), allowed_names=allowed_names
+    )
+    assert not permitted.is_error
+    assert "readable" in permitted.content
+
+
 async def test_registry_unknown_tool_is_error(tmp_path: Path):
     result = await make_registry(tmp_path).execute("missing", "{}")
     assert result.is_error

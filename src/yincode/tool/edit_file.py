@@ -9,6 +9,7 @@ from .registry import _atomic_write, _FileTool, _string
 
 class EditFileTool(_FileTool):
     _name = "edit_file"
+    read_only = False
     _description = "以 new_string 替换文件中唯一匹配的非空 old_string；匹配数不等于 1 则拒绝。"
     _parameters = {
         "type": "object",

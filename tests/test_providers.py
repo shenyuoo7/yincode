@@ -19,6 +19,7 @@ from yincode.llm import (
     ToolCall,
     ToolDefinition,
     ToolResult,
+    Usage,
     new_provider,
 )
 from yincode.prompt import SYSTEM_PROMPT
@@ -180,11 +181,11 @@ async def test_request_contains_history_and_streams_only_body(
     provider = provider_with_http(config(protocol, thinking=thinking), http)
     try:
         events = [event async for event in provider.stream(HISTORY, [])]
-        assert events == [
-            StreamEvent(text="你好"),
-            StreamEvent(text="世界"),
-            StreamEvent(done=True),
-        ]
+        expected = [StreamEvent(text="你好"), StreamEvent(text="世界")]
+        if protocol == "anthropic":
+            expected.append(StreamEvent(usage=Usage(4, 4)))
+        expected.append(StreamEvent(done=True))
+        assert events == expected
         assert response.closed
         assert len(requests) == 1
         body = json.loads(requests[0].content)
@@ -208,10 +209,112 @@ async def test_request_contains_history_and_streams_only_body(
         else:
             assert str(requests[0].url) == "https://compatible.example/v1/chat/completions"
             assert body["messages"] == [{"role": "system", "content": SYSTEM_PROMPT}, *history]
+            assert body["stream_options"] == {"include_usage": True}
             assert "thinking" not in body
     finally:
         await provider.aclose()
     assert http.is_closed
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+async def test_system_suffix_is_appended_to_one_system_message(protocol: ProtocolName) -> None:
+    requests: list[httpx2.Request] = []
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=ResponseStream(payload(protocol)),
+        )
+
+    provider = provider_with_http(
+        config(protocol), httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
+    )
+    try:
+        events = [event async for event in provider.stream(HISTORY, [], "只读计划模式")]
+        assert events[-1] == StreamEvent(done=True)
+        body = json.loads(requests[0].content)
+        system = SYSTEM_PROMPT + "\n\n只读计划模式"
+        if protocol == "anthropic":
+            assert body["system"] == system
+            assert body["messages"][0] == {"role": "user", "content": "我叫小明"}
+        else:
+            assert body["messages"][0] == {"role": "system", "content": system}
+            assert [message["role"] for message in body["messages"]].count("system") == 1
+    finally:
+        await provider.aclose()
+
+
+async def test_openai_empty_choices_usage_chunk_emits_once_before_done() -> None:
+    chunks = payload("openai")
+    chunks[-1] = chunks[-1].replace(
+        b"data: [DONE]\n\n",
+        sse(
+            {
+                "id": "chat-test",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "test-model",
+                "choices": [],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+            }
+        )
+        + b"data: [DONE]\n\n",
+    )
+    response = ResponseStream(chunks)
+    http = httpx2.AsyncClient(
+        transport=httpx2.MockTransport(
+            lambda request: httpx2.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=response
+            )
+        )
+    )
+    provider = provider_with_http(config("openai"), http)
+    try:
+        assert [event async for event in provider.stream(HISTORY, [])] == [
+            StreamEvent(text="你好"),
+            StreamEvent(text="世界"),
+            StreamEvent(usage=Usage(11, 7)),
+            StreamEvent(done=True),
+        ]
+        assert response.closed
+    finally:
+        await provider.aclose()
+
+
+async def test_openai_final_choice_carries_usage() -> None:
+    """兼容端点可把用量附在 finish_reason 所在的最后一个 choices 块。"""
+    chunks = payload("openai")
+    base = {
+        "id": "chat-test",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "test-model",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }
+    chunks[-1] = chunks[-1].replace(
+        sse(base),
+        sse({**base, "usage": {"prompt_tokens": 13, "completion_tokens": 5, "total_tokens": 18}}),
+    )
+    response = ResponseStream(chunks)
+    http = httpx2.AsyncClient(
+        transport=httpx2.MockTransport(
+            lambda request: httpx2.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=response
+            )
+        )
+    )
+    provider = provider_with_http(config("openai"), http)
+    try:
+        assert [event async for event in provider.stream(HISTORY, [])] == [
+            StreamEvent(text="你好"),
+            StreamEvent(text="世界"),
+            StreamEvent(usage=Usage(13, 5)),
+            StreamEvent(done=True),
+        ]
+    finally:
+        await provider.aclose()
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
@@ -634,10 +737,12 @@ async def test_tool_definitions_and_complete_fragmented_call(protocol: ProtocolN
     try:
         events = [event async for event in provider.stream([Message("user", "读文件")], TOOLS)]
         assert events[0] == StreamEvent(text="正在读取")
-        assert len(events) == 3
+        assert len(events) == (4 if protocol == "anthropic" else 3)
         assert events[1].tool_calls[0].id == "call-a"
         assert events[1].tool_calls[0].name == "read_file"
         assert json.loads(events[1].tool_calls[0].input) == {"path": "示例.txt"}
+        if protocol == "anthropic":
+            assert events[-2] == StreamEvent(usage=Usage(4, 4))
         assert events[-1] == StreamEvent(done=True)
         assert response.closed
         body = json.loads(requests[0].content)
@@ -999,7 +1104,7 @@ async def test_tool_batches_preserve_same_name_calls_but_reject_duplicate_ids(
             assert events[-1].err is not None
             assert not any(event.tool_calls or event.done for event in events)
         else:
-            assert len(events) == 3
+            assert len(events) == (4 if protocol == "anthropic" else 3)
             assert [(call.id, call.name) for call in events[1].tool_calls] == [
                 ("call-a", "read_file"),
                 ("call-b", "read_file"),

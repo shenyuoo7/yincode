@@ -9,6 +9,7 @@ from .registry import _atomic_write, _FileTool, _string
 
 class WriteFileTool(_FileTool):
     _name = "write_file"
+    read_only = False
     _description = "创建或覆盖 UTF-8 文件，自动创建父目录。"
     _parameters = {
         "type": "object",

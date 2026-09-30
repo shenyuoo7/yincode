@@ -42,15 +42,32 @@ class Registry:
             for tool in self._tools.values()
         ]
 
+    def read_only_definitions(self) -> list[ToolDefinition]:
+        """按注册顺序导出只读工具的定义。"""
+        return [
+            ToolDefinition(tool.name, tool.description, deepcopy(tool.parameters))
+            for tool in self._tools.values()
+            if tool.read_only
+        ]
+
+    def is_read_only(self, name: str) -> bool:
+        """未知工具按有副作用处理。"""
+        tool = self.get(name)
+        return tool is not None and tool.read_only
+
     async def execute(
         self,
         name: str,
         args: str,
         timeout: float = DEFAULT_TIMEOUT,  # noqa: ASYNC109
+        *,
+        allowed_names: set[str] | None = None,
     ) -> Result:
         tool = self.get(name)
         if tool is None:
             return Result(f"未知工具: {name}", is_error=True)
+        if allowed_names is not None and name not in allowed_names:
+            return Result(f"工具 {name} 在当前模式不可用", is_error=True)
         try:
             return await asyncio.wait_for(tool.execute(args), timeout)
         except TimeoutError:
@@ -166,6 +183,7 @@ class _FileTool:
     _name: str
     _description: str
     _parameters: dict[str, Any]
+    read_only: bool
 
     def __init__(self, cwd: Path | str | None = None) -> None:
         self.cwd = Path(cwd if cwd is not None else Path.cwd()).resolve()

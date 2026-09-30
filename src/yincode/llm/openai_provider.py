@@ -12,7 +12,7 @@ from openai.types.chat import (
 )
 
 from yincode.config import ProviderConfig, redact
-from yincode.llm import Message, StreamEvent, ToolCall, ToolDefinition
+from yincode.llm import Message, StreamEvent, ToolCall, ToolDefinition, Usage
 from yincode.llm._json import object_from_json
 from yincode.prompt import SYSTEM_PROMPT
 
@@ -25,8 +25,11 @@ def _check_call(call_id: str, name: str, raw: str) -> None:
     object_from_json(raw)
 
 
-def _to_openai_messages(msgs: list[Message]) -> list[ChatCompletionMessageParam]:
-    messages: list[ChatCompletionMessageParam] = [{"role": "system", "content": SYSTEM_PROMPT}]
+def _to_openai_messages(
+    msgs: list[Message], system_suffix: str = ""
+) -> list[ChatCompletionMessageParam]:
+    system = SYSTEM_PROMPT + "\n\n" + system_suffix if system_suffix else SYSTEM_PROMPT
+    messages: list[ChatCompletionMessageParam] = [{"role": "system", "content": system}]
     for message in msgs:
         if message.role == "tool":
             messages.extend(
@@ -91,14 +94,15 @@ class OpenAIProvider:
         return self._cfg.model
 
     async def stream(
-        self, msgs: list[Message], tools: list[ToolDefinition]
+        self, msgs: list[Message], tools: list[ToolDefinition], system_suffix: str = ""
     ) -> AsyncIterator[StreamEvent]:
         completed = False
         finish_reason: str | None = None
         call_buffers: dict[int, dict[str, str]] = {}
         calls: list[ToolCall] = []
+        usage: Usage | None = None
         try:
-            messages = _to_openai_messages(msgs)
+            messages = _to_openai_messages(msgs, system_suffix)
             tool_params: list[ChatCompletionToolParam] | Omit = (
                 [
                     {
@@ -115,33 +119,43 @@ class OpenAIProvider:
                 else omit
             )
             stream = await self._client.chat.completions.create(
-                model=self.model, messages=messages, stream=True, tools=tool_params
+                model=self.model,
+                messages=messages,
+                stream=True,
+                stream_options={"include_usage": True},
+                tools=tool_params,
             )
             async with stream:
                 self._streams.add(stream)
                 try:
                     async for chunk in stream:
-                        if chunk.choices:
-                            choice = chunk.choices[0]
-                            if choice.finish_reason:
-                                completed = True
-                                finish_reason = choice.finish_reason
-                            text = choice.delta.content
-                            if text:
-                                yield StreamEvent(text=text)
-                            for part in choice.delta.tool_calls or []:
-                                if not isinstance(part.index, int) or part.index < 0:
-                                    raise RuntimeError("工具调用缺少有效序号")
-                                buffer = call_buffers.setdefault(
-                                    part.index, {"id": "", "name": "", "args": ""}
-                                )
-                                if part.id:
-                                    buffer["id"] += part.id
-                                if part.function:
-                                    if part.function.name:
-                                        buffer["name"] += part.function.name
-                                    if part.function.arguments:
-                                        buffer["args"] += part.function.arguments
+                        if chunk.usage is not None:
+                            usage = Usage(
+                                input_tokens=chunk.usage.prompt_tokens,
+                                output_tokens=chunk.usage.completion_tokens,
+                            )
+                        if not chunk.choices:
+                            continue
+                        choice = chunk.choices[0]
+                        if choice.finish_reason:
+                            completed = True
+                            finish_reason = choice.finish_reason
+                        text = choice.delta.content
+                        if text:
+                            yield StreamEvent(text=text)
+                        for part in choice.delta.tool_calls or []:
+                            if not isinstance(part.index, int) or part.index < 0:
+                                raise RuntimeError("工具调用缺少有效序号")
+                            buffer = call_buffers.setdefault(
+                                part.index, {"id": "", "name": "", "args": ""}
+                            )
+                            if part.id:
+                                buffer["id"] += part.id
+                            if part.function:
+                                if part.function.name:
+                                    buffer["name"] += part.function.name
+                                if part.function.arguments:
+                                    buffer["args"] += part.function.arguments
                 finally:
                     self._streams.discard(stream)
             if not completed:
@@ -167,6 +181,8 @@ class OpenAIProvider:
         else:
             if calls:
                 yield StreamEvent(tool_calls=calls)
+            if usage is not None:
+                yield StreamEvent(usage=usage)
             yield StreamEvent(done=True)
 
     async def aclose(self) -> None:
