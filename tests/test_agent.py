@@ -6,6 +6,7 @@ import pytest
 
 from yincode.conversation import Conversation
 from yincode.llm import Message, Request, StreamEvent, ToolCall, ToolDefinition, Usage
+from yincode.permission import Mode
 
 
 class ScriptProvider:
@@ -53,7 +54,10 @@ async def test_read_result_is_carried_into_continuation(tmp_path: Path):
         ]
     )
     conv = conversation()
-    events = [event async for event in Agent(provider, new_default_registry(tmp_path)).run(conv)]
+    events = [
+        event
+        async for event in Agent(provider, new_default_registry(tmp_path)).run(conv, Mode.BYPASS)
+    ]
     assert [e.tool.phase for e in events if e.tool] == [Phase.START, Phase.END]
     assert [e.tool.tool_call_id for e in events if e.tool] == ["c1", "c1"]
     assert provider.requests[1][-1].tool_results[0].tool_call_id == "c1"
@@ -79,7 +83,9 @@ async def test_second_tool_batch_is_executed_without_user_prompt(tmp_path: Path)
         ]
     )
     conv = conversation()
-    events = [e async for e in Agent(provider, new_default_registry(tmp_path)).run(conv)]
+    events = [
+        e async for e in Agent(provider, new_default_registry(tmp_path)).run(conv, Mode.BYPASS)
+    ]
     assert (tmp_path / "one.txt").read_text() == "first"
     assert (tmp_path / "two.txt").read_text() == "second"
     assert conv.messages()[-1].content == "done"
@@ -108,7 +114,7 @@ async def test_stream_error_keeps_legal_tail_and_redacts(tmp_path: Path, continu
         new_default_registry(tmp_path),
         redactor=lambda s: s.replace("test-secret", "[redacted]"),
     )
-    events = [e async for e in agent.run(conv)]
+    events = [e async for e in agent.run(conv, Mode.BYPASS)]
     assert events[-1].err is not None
     assert "test-secret" not in str(events[-1].err)
     assert conv.messages()[-1].role == "assistant"
@@ -117,17 +123,21 @@ async def test_stream_error_keeps_legal_tail_and_redacts(tmp_path: Path, continu
 
 
 @pytest.mark.parametrize("raw", ["[]", '{"x":NaN}', '{"x":Infinity}', '{"x":1e999}'])
-async def test_invalid_call_never_enters_protocol_history(raw: str):
+async def test_invalid_call_has_safe_history_and_paired_denial(raw: str):
     from yincode.agent import Agent
     from yincode.tool import Registry
 
     provider = ScriptProvider(
-        [[StreamEvent(tool_calls=[ToolCall("c1", "read_file", raw)]), StreamEvent(done=True)]]
+        [
+            [StreamEvent(tool_calls=[ToolCall("c1", "read_file", raw)]), StreamEvent(done=True)],
+            [StreamEvent(text="已调整"), StreamEvent(done=True)],
+        ]
     )
     conv = conversation()
-    events = [e async for e in Agent(provider, Registry()).run(conv)]
-    assert events[-1].err
-    assert not any(m.tool_calls for m in conv.messages())
+    events = [e async for e in Agent(provider, Registry()).run(conv, Mode.BYPASS)]
+    assert events[-1].done
+    assert conv.messages()[1].tool_calls[0].input == "{}"
+    assert conv.messages()[2].tool_results[0].is_error
     assert conv.messages()[-1].role == "assistant"
 
 
@@ -161,7 +171,7 @@ async def test_cancellation_pairs_whole_batch_and_waits_for_tool_cleanup():
     conv = conversation()
 
     async def consume():
-        async for _ in Agent(provider, registry).run(conv):
+        async for _ in Agent(provider, registry).run(conv, Mode.BYPASS):
             pass
 
     task = asyncio.create_task(consume())
@@ -183,7 +193,7 @@ async def test_aclose_at_start_event_pairs_batch_without_executing(tmp_path: Pat
     call = ToolCall("c1", "write_file", '{"path":"never.txt","content":"x"}')
     provider = ScriptProvider([[StreamEvent(tool_calls=[call]), StreamEvent(done=True)]])
     conv = conversation()
-    iterator = Agent(provider, new_default_registry(tmp_path)).run(conv)
+    iterator = Agent(provider, new_default_registry(tmp_path)).run(conv, Mode.BYPASS)
     event = await anext(iterator)
     assert event.iter == 1
     event = await anext(iterator)
@@ -202,7 +212,9 @@ async def test_empty_reply_and_eof_are_handled_without_empty_assistant(tmp_path:
         conv = conversation()
         events = [
             e
-            async for e in Agent(ScriptProvider([script]), new_default_registry(tmp_path)).run(conv)
+            async for e in Agent(ScriptProvider([script]), new_default_registry(tmp_path)).run(
+                conv, Mode.BYPASS
+            )
         ]
         assert conv.messages()[-1].role == "assistant"
         assert conv.messages()[-1].content
@@ -223,7 +235,7 @@ async def test_secret_split_across_text_chunks_is_redacted_before_emission(tmp_p
         redactor=lambda s: s.replace("key-123", "[redacted]"),
         secrets=("key-123",),
     )
-    events = [e async for e in agent.run(conv)]
+    events = [e async for e in agent.run(conv, Mode.BYPASS)]
     assert "".join(e.text for e in events) == "reply [redacted] end"
     assert conv.messages()[-1].content == "reply [redacted] end"
 
@@ -239,7 +251,7 @@ async def test_empty_continuation_produces_visible_nonempty_tail():
         ]
     )
     conv = conversation()
-    events = [e async for e in Agent(provider, Registry()).run(conv)]
+    events = [e async for e in Agent(provider, Registry()).run(conv, Mode.BYPASS)]
     assert conv.messages()[2].tool_results[0].is_error
     assert conv.messages()[-1].content
     assert conv.messages()[-1].content == "".join(e.text for e in events)
@@ -288,7 +300,7 @@ async def test_usage_events_and_unknown_tool_limit():
         ]
     )
     conv = conversation()
-    events = [e async for e in Agent(provider, Registry()).run(conv)]
+    events = [e async for e in Agent(provider, Registry()).run(conv, Mode.BYPASS)]
     assert len(provider.requests) == MAX_UNKNOWN_RUN
     assert [e.usage for e in events if e.usage] == [Usage(i + 1, 2) for i in range(MAX_UNKNOWN_RUN)]
     assert [e.notice for e in events if e.notice] == [NOTICE_UNKNOWN_TOOLS]
@@ -317,7 +329,9 @@ async def test_cancel_while_provider_is_silent_closes_stream():
     provider = SilentProvider()
     conv = conversation()
     cancel = asyncio.Event()
-    task = asyncio.create_task(collect(Agent(provider, Registry()).run(conv, cancel=cancel)))
+    task = asyncio.create_task(
+        collect(Agent(provider, Registry()).run(conv, Mode.BYPASS, cancel=cancel))
+    )
     await asyncio.wait_for(provider.started.wait(), 2)
     cancel.set()
     events = await asyncio.wait_for(task, 2)
@@ -378,7 +392,7 @@ async def test_consecutive_read_only_calls_overlap_before_write():
         ]
     )
     conv = conversation()
-    events = await collect(Agent(provider, registry).run(conv))
+    events = await collect(Agent(provider, registry).run(conv, Mode.BYPASS))
     assert reader.peak == 2
     assert writer.write_after_reads
     assert [result.tool_call_id for result in conv.messages()[2].tool_results] == ["r1", "r2", "w1"]
@@ -417,7 +431,7 @@ async def test_max_iterations_and_unknown_counter_reset():
             StreamEvent(done=True),
         ]
     conv = conversation()
-    events = await collect(Agent(provider, registry).run(conv))
+    events = await collect(Agent(provider, registry).run(conv, Mode.BYPASS))
     assert len(provider.requests) == MAX_ITERATIONS
     assert [e.notice for e in events if e.notice] == [NOTICE_MAX_ITER]
     assert conv.last_role() == "assistant"
@@ -453,7 +467,9 @@ async def test_cancel_event_during_tool_pairs_results():
     )
     conv = conversation()
     cancel = asyncio.Event()
-    task = asyncio.create_task(collect(Agent(provider, registry).run(conv, cancel=cancel)))
+    task = asyncio.create_task(
+        collect(Agent(provider, registry).run(conv, Mode.BYPASS, cancel=cancel))
+    )
     await asyncio.wait_for(blocker.started.wait(), 2)
     cancel.set()
     events = await asyncio.wait_for(task, 2)
@@ -508,7 +524,9 @@ async def test_cancel_keeps_completed_result_in_read_only_batch():
     )
     conv = conversation()
     cancel = asyncio.Event()
-    task = asyncio.create_task(collect(Agent(provider, registry).run(conv, cancel=cancel)))
+    task = asyncio.create_task(
+        collect(Agent(provider, registry).run(conv, Mode.BYPASS, cancel=cancel))
+    )
     await asyncio.wait_for(tool.fast_done.wait(), 2)
     cancel.set()
     await asyncio.wait_for(task, 2)
@@ -576,7 +594,9 @@ async def test_cancellation_during_environment_collection_waits_for_cleanup(monk
     provider = ScriptProvider([])
     conv = conversation()
     cancel = asyncio.Event()
-    task = asyncio.create_task(collect(Agent(provider, Registry()).run(conv, cancel=cancel)))
+    task = asyncio.create_task(
+        collect(Agent(provider, Registry()).run(conv, Mode.BYPASS, cancel=cancel))
+    )
     await asyncio.wait_for(started.wait(), 2)
     cancel.set()
     events = await asyncio.wait_for(task, 2)

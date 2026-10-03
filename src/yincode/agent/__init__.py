@@ -7,6 +7,7 @@ from .agent import (
     NOTICE_MAX_ITER,
     NOTICE_UNKNOWN_TOOLS,
     Agent,
+    ApprovalRequest,
     Event,
     Mode,
     Phase,
@@ -15,6 +16,7 @@ from .agent import (
 
 __all__ = [
     "Agent",
+    "ApprovalRequest",
     "Event",
     "Mode",
     "Phase",

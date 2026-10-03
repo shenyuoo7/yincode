@@ -25,6 +25,8 @@ async def consume_stream(app: "YinCodeApp") -> None:
                 break
             if event.tool is not None:
                 app._handle_tool_event(event.tool)
+            if event.approval is not None:
+                app._begin_approval(event.approval)
             if event.usage is not None:
                 app.usage_in += event.usage.input_tokens
                 app.usage_out += event.usage.output_tokens

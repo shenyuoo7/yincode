@@ -4,7 +4,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from enum import Enum, IntEnum
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +12,8 @@ from yincode import __version__, prompt
 from yincode.conversation import Conversation
 from yincode.llm import Provider, Request, StreamEvent, System, ToolCall, ToolResult, Usage
 from yincode.llm._json import object_from_json
-from yincode.tool import Registry
+from yincode.permission import Decision, Engine, Mode, Outcome, new_engine
+from yincode.tool import Registry, Result
 
 MAX_ITERATIONS = 25
 MAX_UNKNOWN_RUN = 3
@@ -23,9 +24,12 @@ NOTICE_STREAM_ERR = "（请求出错，本轮已中断。）"
 NOTICE_CANCELLED = "（已取消。）"
 
 
-class Mode(IntEnum):
-    NORMAL = 0
-    PLAN = 1
+@dataclass(frozen=True, slots=True)
+class ApprovalRequest:
+    name: str
+    args: str
+    reason: str
+    respond: asyncio.Future[Outcome]
 
 
 class Phase(Enum):
@@ -52,6 +56,7 @@ class Event:
     notice: str = ""
     done: bool = False
     err: Exception | None = None
+    approval: ApprovalRequest | None = None
 
     @property
     def iteration(self) -> int:
@@ -68,6 +73,7 @@ class Event:
                     bool(self.notice),
                     self.done,
                     self.err is not None,
+                    self.approval is not None,
                 )
             )
             > 1
@@ -94,6 +100,7 @@ class Agent:
         registry: Registry,
         version: str = __version__,
         *,
+        engine: Engine | None = None,
         cwd: str | Path | None = None,
         redactor: Callable[[str], str] | None = None,
         secrets: tuple[str, ...] = (),
@@ -101,7 +108,15 @@ class Agent:
         self._provider = provider
         self._registry = registry
         self._version = version
-        self._cwd = Path(cwd if cwd is not None else Path.cwd()).resolve()
+        self._cwd = Path(cwd if cwd is not None else registry.cwd).resolve()
+        self.engine = engine if engine is not None else new_engine(str(self._cwd))[0]
+        if not self.engine.deny_all and self._cwd != Path(self.engine.root):
+            raise ValueError("权限引擎与会话工作目录必须一致")
+        for definition in registry.definitions():
+            tool = registry.get(definition.name)
+            directory = getattr(tool, "cwd", None)
+            if directory is not None and Path(directory).resolve() != self._cwd:
+                raise ValueError("工具与会话工作目录必须一致")
         self._redact = redactor or (lambda text: text)
         self._secrets = tuple(secret for secret in secrets if secret)
 
@@ -133,24 +148,24 @@ class Agent:
         for call in calls:
             if not call.id.strip() or not call.name.strip() or call.id in ids:
                 raise RuntimeError("工具调用的 id 或名称不完整，或调用 id 重复")
-            try:
-                object_from_json(call.input)
-            except (ValueError, TypeError):
-                raise RuntimeError("工具调用参数不是完整 JSON 对象") from None
             ids.add(call.id)
             normalized.append(ToolCall(call.id, call.name, call.input or "{}"))
         return normalized
 
     def _public_calls(self, calls: list[ToolCall]) -> list[ToolCall]:
+        def public_input(raw: str) -> str:
+            try:
+                value = object_from_json(raw)
+            except (ValueError, TypeError):
+                # 拒绝非法原始参数时，历史仍需能被 SDK 序列化并配对错误结果。
+                value = {}
+            return json.dumps(self._redact_values(value), ensure_ascii=False, allow_nan=False)
+
         return [
             ToolCall(
                 self._redact(call.id),
                 self._redact(call.name),
-                json.dumps(
-                    self._redact_values(object_from_json(call.input)),
-                    ensure_ascii=False,
-                    allow_nan=False,
-                ),
+                public_input(call.input),
             )
             for call in calls
         ]
@@ -224,16 +239,27 @@ class Agent:
         allowed_names: set[str],
         cancel: asyncio.Event,
         slots: list[ToolResult | None],
+        mode: Mode,
     ) -> bool:
         """执行一个连续只读批或单个副作用工具，并等待取消清理。"""
-        tasks = [
-            asyncio.create_task(
-                self._registry.execute(
-                    calls[index].name, calls[index].input, allowed_names=allowed_names
-                )
+        if not indexes:
+            return True
+
+        async def execute_checked(index: int) -> Result:
+            call = calls[index]
+            # 审批期间路径可能被改动；执行开始前重验强制边界与拒绝规则。
+            decision, reason = self.engine.check(
+                mode,
+                call,
+                self._registry.is_read_only(call.name),
+                registered=self._registry.get(call.name) is not None,
+                allowed=call.name in allowed_names,
             )
-            for index in indexes
-        ]
+            if decision is Decision.DENY:
+                return Result(reason, is_error=True)
+            return await self._registry.execute(call.name, call.input, allowed_names=allowed_names)
+
+        tasks = [asyncio.create_task(execute_checked(index)) for index in indexes]
         cancel_task = asyncio.create_task(cancel.wait())
         try:
             done, _ = await asyncio.wait({*tasks, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
@@ -275,7 +301,7 @@ class Agent:
     async def run(
         self,
         conv: Conversation,
-        mode: Mode = Mode.NORMAL,
+        mode: Mode = Mode.DEFAULT,
         cancel: asyncio.Event | None = None,
     ) -> AsyncIterator[Event]:
         cancel = cancel or asyncio.Event()
@@ -290,6 +316,7 @@ class Agent:
         batch_saved = False
         final_saved = False
         unknown_run = 0
+        approval_future: asyncio.Future[Outcome] | None = None
         try:
             environment = await self._environment(cancel)
             system = System(
@@ -349,7 +376,50 @@ class Agent:
                         while end < len(calls) and self._registry.is_read_only(calls[end].name):
                             end += 1
                     group = list(range(index, end))
-                    completed = await self._run_group(calls, group, allowed_names, cancel, slots)
+                    permitted: list[int] = []
+                    for position in group:
+                        call = calls[position]
+                        decision, reason = self.engine.check(
+                            mode,
+                            call,
+                            self._registry.is_read_only(call.name),
+                            registered=self._registry.get(call.name) is not None,
+                            allowed=call.name in allowed_names,
+                        )
+                        if decision is Decision.ASK:
+                            approval_future = asyncio.get_running_loop().create_future()
+                            yield Event(
+                                approval=ApprovalRequest(
+                                    self._redact(call.name),
+                                    self._redact(call.input),
+                                    self._redact(reason),
+                                    approval_future,
+                                )
+                            )
+                            outcome = await self._await_approval(approval_future, cancel)
+                            approval_future = None
+                            if cancel.is_set():
+                                break
+                            if outcome is Outcome.DENY_ONCE:
+                                decision, reason = Decision.DENY, "用户拒绝本次工具调用"
+                            else:
+                                decision = Decision.ALLOW
+                                if outcome is Outcome.ALLOW_FOREVER:
+                                    try:
+                                        await self._persist_allow(call)
+                                    except Exception:
+                                        yield Event(
+                                            notice="本次已允许，永久规则未保存；后续仍需确认。"
+                                        )
+                        if decision is Decision.DENY:
+                            slots[position] = ToolResult(call.id, self._redact(reason), True)
+                        else:
+                            permitted.append(position)
+                    if cancel.is_set():
+                        break
+                    completed = await self._run_group(
+                        calls, permitted, allowed_names, cancel, slots, mode
+                    )
                     if not completed:
                         break
                     index = end
@@ -402,10 +472,44 @@ class Agent:
             final_saved = True
             yield Event(err=RuntimeError(message))
         finally:
+            if approval_future is not None and not approval_future.done():
+                approval_future.cancel()
             if batch_saved:
                 self._finish_batch(conv, history_calls, slots)
             if not final_saved:
                 conv.add_assistant("[请求已取消。]")
+
+    @staticmethod
+    async def _await_approval(respond: asyncio.Future[Outcome], cancel: asyncio.Event) -> Outcome:
+        waiter = asyncio.create_task(cancel.wait())
+        try:
+            waiting: set[asyncio.Future[Any]] = {respond, waiter}
+            await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+            if cancel.is_set():
+                return Outcome.DENY_ONCE
+            return respond.result()
+        finally:
+            if not respond.done():
+                respond.cancel()
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+
+    async def _persist_allow(self, call: ToolCall) -> None:
+        task = asyncio.create_task(asyncio.to_thread(self.engine.persist_local_allow, call))
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # 原子写入线程拥有磁盘变更，必须等其收尾再传播取消。
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not task.cancelled():
+                task.exception()
+            raise
 
     async def _environment(self, cancel: asyncio.Event) -> str | None:
         """环境采集也受本轮取消控制，收尾后再允许下一轮运行。"""

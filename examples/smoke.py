@@ -13,10 +13,11 @@ from pathlib import Path
 from typing import cast
 
 from yincode import __version__
-from yincode.agent import Agent, Event, Mode
+from yincode.agent import Agent, Event
 from yincode.config import Config, ConfigError, load, redact
 from yincode.conversation import Conversation
 from yincode.llm import new_provider
+from yincode.permission import Mode, new_engine
 from yincode.tool import new_default_registry
 
 
@@ -29,6 +30,7 @@ async def run(config: Config, cwd: Path, prompts: list[str], plan: bool) -> None
             provider,
             new_default_registry(cwd=cwd),
             __version__,
+            engine=new_engine(str(cwd))[0],
             cwd=cwd,
             redactor=lambda text: redact(text, secrets),
             secrets=secrets,
@@ -40,7 +42,7 @@ async def run(config: Config, cwd: Path, prompts: list[str], plan: bool) -> None
             async with aclosing(
                 cast(
                     AsyncGenerator[Event, None],
-                    agent.run(conversation, Mode.PLAN if plan else Mode.NORMAL, asyncio.Event()),
+                    agent.run(conversation, Mode.PLAN if plan else Mode.BYPASS, asyncio.Event()),
                 )
             ) as events:
                 async for event in events:

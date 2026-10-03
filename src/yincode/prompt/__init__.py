@@ -72,7 +72,7 @@ def render_banner_text(version: str, cwd: str, width: int = 80) -> Text:
     banner.append(f"{indent}yincode v{version}\n", "bold #D8D2C5")
     banner.append(f"{indent}{cwd}\n", "#A39E93")
     banner.append(f"{indent}Ready", GOLD)
-    banner.append(" · Enter 发送 · Alt+Enter 换行 · /exit 退出", "#A39E93")
+    banner.append(" · Enter 发送 · Alt+Enter 换行 · Shift+Tab 权限 · /exit 退出", "#A39E93")
 
     # 按终端显示单元折行，同时保留颜色和完整的中文路径；不解析路径中的标记。
     wrapped: list[Text] = []

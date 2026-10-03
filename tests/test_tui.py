@@ -12,9 +12,9 @@ from textual.containers import ScrollableContainer
 from textual.geometry import Size
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
-from yincode.agent import Mode
 from yincode.config import ProviderConfig
 from yincode.llm import Message, Request, StreamEvent, ToolCall, ToolDefinition, Usage
+from yincode.permission import Mode
 from yincode.prompt import EXECUTE_DIRECTIVE, build_system_prompt, plan_reminder, render_banner_text
 from yincode.tui import SessionState, YinCodeApp, view
 from yincode.tui.view import streaming_block
@@ -114,6 +114,117 @@ def test_wait_indicator_animates_before_the_first_second_or_text() -> None:
     assert first != second
 
 
+async def test_permission_modes_cycle_and_persist_across_turns(tmp_path):
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        assert app.mode is Mode.DEFAULT
+        for mode, label in [
+            (Mode.ACCEPT_EDITS, "ACCEPT EDITS"),
+            (Mode.PLAN, "PLAN"),
+            (Mode.BYPASS, "BYPASS"),
+            (Mode.DEFAULT, "DEFAULT"),
+        ]:
+            await pilot.press("shift+tab")
+            assert app.mode is mode
+            assert label in static_text(app, "#statusbar")
+        await pilot.press("shift+tab")
+        await app.submit("hello")
+        await fake.events.put(StreamEvent(text="ok"))
+        await fake.events.put(StreamEvent(done=True))
+        await wait_for_state(app, SessionState.IDLE)
+        assert app.mode is Mode.ACCEPT_EDITS
+
+
+async def queue_approval(app, fake, pilot):
+    await app.submit("写入文件")
+    await fake.events.put(
+        StreamEvent(
+            tool_calls=[
+                ToolCall(
+                    "w",
+                    "write_file",
+                    '{"path":"approved.txt","content":"unit-test-secret fixture"}',
+                )
+            ]
+        )
+    )
+    await fake.events.put(StreamEvent(done=True))
+    for _ in range(30):
+        await pilot.pause(0.01)
+        if app.state is SessionState.APPROVING:
+            return
+    raise AssertionError("未进入审批状态")
+
+
+@pytest.mark.parametrize(
+    "keys,exists,permanent",
+    [
+        (["1"], True, False),
+        (["down", "enter"], True, True),
+        (["3"], False, False),
+        (["up", "enter"], False, False),
+        (["down", "down", "up", "2"], True, True),
+    ],
+)
+async def test_permission_approval_menu_controls_real_write(tmp_path, keys, exists, permanent):
+    app, fake = setup_app(tmp_path)
+    async with app.run_test(size=(80, 30)) as pilot:
+        await queue_approval(app, fake, pilot)
+        assert app.approve_cursor == 0
+        display = static_text(app, "#streaming")
+        assert "允许本次" in display and "永久允许" in display and "拒绝本次" in display
+        assert "unit-test-secret" not in display
+        await pilot.press("shift+tab")
+        assert app.mode is Mode.DEFAULT
+        await pilot.press(*keys)
+        await fake.events.put(StreamEvent(text="完成"))
+        await fake.events.put(StreamEvent(done=True))
+        await wait_for_state(app, SessionState.IDLE)
+        assert (tmp_path / "approved.txt").exists() is exists
+        local_path = Path(app.engine.local_path)
+        assert await asyncio.to_thread(local_path.exists) is permanent
+        assert app.pending is None
+        assert app.query_one("#input", TextArea).text == ""
+
+
+@pytest.mark.parametrize("key", ["escape", "ctrl+c"])
+async def test_permission_approval_cancel_recovers_without_exit(tmp_path, key):
+    from yincode.permission import Outcome
+
+    app, fake = setup_app(tmp_path)
+    async with app.run_test() as pilot:
+        await queue_approval(app, fake, pilot)
+        pending = app.pending
+        await pilot.press(key)
+        await wait_for_state(app, SessionState.IDLE)
+        assert pending.respond.result() is Outcome.DENY_ONCE
+        assert not (tmp_path / "approved.txt").exists()
+        assert not app._resources_closing
+        await app.submit("继续")
+        await fake.events.put(StreamEvent(text="可以继续"))
+        await fake.events.put(StreamEvent(done=True))
+        await wait_for_state(app, SessionState.IDLE)
+        assert app.conv.messages()[-1].content == "可以继续"
+
+
+async def test_permission_start_mode_plan_applies_reminder(tmp_path):
+    (tmp_path / ".yincode").mkdir()
+    (tmp_path / ".yincode/permissions.local.yaml").write_text("default_mode: plan")
+    app, fake = setup_app(tmp_path)
+    async with app.run_test():
+        assert app.mode is Mode.PLAN
+        await app.submit("调研")
+        await fake.events.put(StreamEvent(text="计划"))
+        await fake.events.put(StreamEvent(done=True))
+        await wait_for_state(app, SessionState.IDLE)
+        assert fake.model_requests[0].reminder
+        assert {definition.name for definition in fake.tool_requests[0]} == {
+            "read_file",
+            "glob",
+            "grep",
+        }
+
+
 @pytest.mark.asyncio
 async def test_plan_requires_a_completed_plan_before_do_starts_execution(tmp_path: Path) -> None:
     app, fake = setup_app(tmp_path)
@@ -140,7 +251,7 @@ async def test_plan_requires_a_completed_plan_before_do_starts_execution(tmp_pat
         await wait_for_state(app, SessionState.IDLE)
         await app.submit("/do")
         await pilot.pause()
-        assert app.mode is Mode.NORMAL
+        assert app.mode is Mode.DEFAULT
         assert "PLAN" not in static_text(app, "#statusbar")
         assert app.conv.messages()[-1] == Message("user", EXECUTE_DIRECTIVE)
         assert fake.model_requests[-1].reminder == ""
@@ -212,7 +323,7 @@ async def test_single_provider_banner_input_and_status(tmp_path: Path) -> None:
         assert len(app.transcript) == 1
         assert "❯" in static_text(app, "#input-prefix")
         status = static_text(app, "#statusbar")
-        assert "本地模型" in status and "test-model" in status
+        assert "DEFAULT" in status and "本地模型" not in status and "test-model" in status
     assert fake.client_closed == 1
 
 
@@ -309,7 +420,8 @@ async def test_selection_uses_arrow_enter_without_creating_unused_clients(tmp_pa
         assert app.state is SessionState.IDLE
         assert len(created) == 1 and app.provider is created[0]
         assert created[0].name == "第二个"
-        assert "第二个" in static_text(app, "#statusbar")
+        assert "DEFAULT" in static_text(app, "#statusbar")
+        assert "第二个" not in static_text(app, "#statusbar")
         assert app.focused is app.query_one("#input", TextArea)
         assert not app.query_one("#providers", OptionList).display
     assert created[0].client_closed == 1
@@ -1009,7 +1121,7 @@ def test_console_replay_escapes_untrusted_terminal_controls(
         "markdown": lambda: view.render_markdown(untrusted, 0.2),
         "error": lambda: view.error_block(untrusted, 0.2),
         "user": lambda: view.user_block(untrusted),
-        "status": lambda: view.status_bar(untrusted, untrusted),
+        "status": lambda: view.status_bar(Mode.DEFAULT, untrusted),
     }
     output = render([blocks[view_kind]()], width=200)
     assert all(

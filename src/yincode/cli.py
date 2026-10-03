@@ -26,10 +26,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     app = None
     exit_code = 0
     try:
+        from yincode.permission import new_engine
         from yincode.tool import new_default_registry
         from yincode.tui import YinCodeApp
 
-        app = YinCodeApp(cfg.providers, cwd=str(cwd), registry=new_default_registry(cwd=cwd))
+        engine, engine_error = new_engine(str(cwd))
+        if engine_error is not None:
+            stderr.print(Text("权限引擎无法确定项目根，已拒绝全部工具执行。", style="red"))
+        app = YinCodeApp(
+            cfg.providers, cwd=str(cwd), registry=new_default_registry(cwd=cwd), engine=engine
+        )
         app.run()
     except KeyboardInterrupt:
         pass

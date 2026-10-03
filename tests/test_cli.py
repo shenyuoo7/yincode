@@ -59,7 +59,7 @@ def test_completed_transcript_is_replayed_once_after_ui(monkeypatch, tmp_path, c
     configure_project(monkeypatch, tmp_path)
 
     class CompletedApp:
-        def __init__(self, providers, *, cwd, registry):
+        def __init__(self, providers, *, cwd, registry, engine):
             self.transcript = [Text("YIN snake"), Text("remember 42"), Text("okay 42")]
 
         def run(self):
@@ -77,7 +77,7 @@ def test_constructor_failure_is_redacted_without_traceback(monkeypatch, tmp_path
     configure_project(monkeypatch, tmp_path)
 
     class BrokenApp:
-        def __init__(self, providers, *, cwd, registry):
+        def __init__(self, providers, *, cwd, registry, engine):
             raise RuntimeError("cannot initialize private-value")
 
     monkeypatch.setitem(sys.modules, "yincode.tui", SimpleNamespace(YinCodeApp=BrokenApp))
@@ -95,7 +95,7 @@ def test_cli_tool_registry_reads_relative_to_the_project(monkeypatch, tmp_path, 
     (tmp_path / "sample.txt").write_text("project fixture", encoding="utf-8")
 
     class ToolApp:
-        def __init__(self, providers, *, cwd, registry):
+        def __init__(self, providers, *, cwd, registry, engine):
             self.registry = registry
             self.transcript = []
 

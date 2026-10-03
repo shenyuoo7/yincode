@@ -19,16 +19,18 @@ from textual.timer import Timer
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
 from yincode import __version__
-from yincode.agent import Agent, Mode, Phase, ToolEvent
+from yincode.agent import Agent, ApprovalRequest, Phase, ToolEvent
 from yincode.config import ProviderConfig, redact
 from yincode.conversation import Conversation
 from yincode.llm import Provider, new_provider
+from yincode.permission import Engine, Mode, Outcome, new_engine
 from yincode.prompt import EXECUTE_DIRECTIVE, render_banner_text
 from yincode.tool import Registry, new_default_registry
 
 from .select import provider_options
 from .stream import consume_stream
 from .view import (
+    approval_block,
     error_block,
     notice_block,
     render_markdown,
@@ -45,6 +47,7 @@ class SessionState(Enum):
     SELECTING = auto()
     IDLE = auto()
     STREAMING = auto()
+    APPROVING = auto()
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +63,12 @@ class MessageInput(TextArea):
     """Enter 发消息，Alt+Enter 插入换行。"""
 
     async def on_key(self, event: events.Key) -> None:
+        app = cast(YinCodeApp, self.app)
+        if app.state is SessionState.APPROVING:
+            event.stop()
+            event.prevent_default()
+            app._approval_key(event.key)
+            return
         if event.key not in ("enter", "alt+enter"):
             return
         # 字符与控制键必须在同一组件队列处理，避免优先绑定抢先读取旧正文。
@@ -101,6 +110,7 @@ class YinCodeApp(App[None]):
     BINDINGS = [
         Binding("ctrl+c", "cancel_or_quit", "取消/退出", show=False, priority=True),
         Binding("escape", "cancel_turn", "取消本轮", show=False, priority=True),
+        Binding("shift+tab", "cycle_mode", "切换权限模式", show=False, priority=True),
     ]
 
     def __init__(
@@ -110,6 +120,7 @@ class YinCodeApp(App[None]):
         provider_factory: Callable[[ProviderConfig], Provider] | None = None,
         cwd: str | Path | None = None,
         registry: Registry | None = None,
+        engine: Engine | None = None,
     ) -> None:
         if not providers:
             raise ValueError("至少需要一个模型配置")
@@ -124,7 +135,10 @@ class YinCodeApp(App[None]):
         self.provider: Provider | None = None
         self.agent: Agent | None = None
         self.conv = Conversation()
-        self.mode = Mode.NORMAL
+        self.engine = engine if engine is not None else new_engine(str(self.cwd))[0]
+        self.mode = self.engine.start_mode()
+        self.pending: ApprovalRequest | None = None
+        self.approve_cursor = 0
         self._has_plan = False
         self.iter = 0
         self.usage_in = 0
@@ -161,6 +175,8 @@ class YinCodeApp(App[None]):
         )
         self.query_one("#streaming-panel").display = False
         self.transcript.append(render_banner_text(__version__, str(self.cwd), self.size.width))
+        for warning in self.engine.warnings:
+            self.transcript.append(notice_block(self._redact(warning)))
         if len(self.providers) == 1:
             self._select_provider(0)
         else:
@@ -177,6 +193,7 @@ class YinCodeApp(App[None]):
                 self.provider,
                 self._tool_registry,
                 __version__,
+                engine=self.engine,
                 cwd=self.cwd,
                 redactor=self._redact,
                 secrets=tuple(cfg.api_key for cfg in self.providers),
@@ -226,7 +243,7 @@ class YinCodeApp(App[None]):
                 self.query_one("#input", MessageInput).clear()
                 self._append_history(notice_block("请先在 /plan 模式中生成计划"))
                 return
-            self.mode = Mode.NORMAL
+            self.mode = Mode.DEFAULT
             self._has_plan = False
             self.conv.add_user(EXECUTE_DIRECTIVE)
         else:
@@ -252,7 +269,10 @@ class YinCodeApp(App[None]):
         await consume_stream(self)
 
     def _tick(self) -> None:
-        if self.state is SessionState.STREAMING and not self._resources_closing:
+        if (
+            self.state in (SessionState.STREAMING, SessionState.APPROVING)
+            and not self._resources_closing
+        ):
             self._refresh_streaming_view()
 
     def _refresh_streaming_view(self, *, follow_output: bool = False) -> None:
@@ -266,7 +286,9 @@ class YinCodeApp(App[None]):
         streaming = self.query_one("#streaming", Static)
         elapsed = time.monotonic() - self.turn_start
         block: RenderableType
-        if self.cur_tools:
+        if self.state is SessionState.APPROVING and self.pending is not None:
+            block = approval_block(self.pending, self.approve_cursor)
+        elif self.cur_tools:
             block = Group(
                 *(tool_streaming_block(tool.name, tool.args, elapsed) for tool in self.cur_tools)
             )
@@ -345,6 +367,7 @@ class YinCodeApp(App[None]):
         self._pending_stream_follow = None
         self.state = SessionState.IDLE
         self.cur_reply = ""
+        self._clear_approval()
         self.cur_tools.clear()
         self.iter = 0
         self.turn_cancel = None
@@ -362,9 +385,8 @@ class YinCodeApp(App[None]):
         if self.provider is not None:
             self.query_one("#statusbar", Static).update(
                 status_bar(
-                    self.provider.name,
+                    self.mode,
                     self.provider.model,
-                    plan=self.mode is Mode.PLAN,
                     usage_in=self.usage_in,
                     usage_out=self.usage_out,
                 )
@@ -400,6 +422,7 @@ class YinCodeApp(App[None]):
             if self._resources_closed:
                 return
             self._resources_closing = True
+            self._clear_approval()
             self._pending_stream_follow = None
             self._stop_timer()
             task = self._stream_task
@@ -431,14 +454,63 @@ class YinCodeApp(App[None]):
         self.exit()
 
     async def action_cancel_or_quit(self) -> None:
-        if self.state is SessionState.STREAMING:
+        if self.state in (SessionState.STREAMING, SessionState.APPROVING):
             self.action_cancel_turn()
         else:
             await self.action_quit()
 
     def action_cancel_turn(self) -> None:
-        if self.state is SessionState.STREAMING and self.turn_cancel is not None:
+        if (
+            self.state in (SessionState.STREAMING, SessionState.APPROVING)
+            and self.turn_cancel is not None
+        ):
             self.turn_cancel.set()
+            self._clear_approval()
+
+    def _clear_approval(self) -> None:
+        if self.pending is not None and not self.pending.respond.done():
+            self.pending.respond.set_result(Outcome.DENY_ONCE)
+        self.pending = None
+
+    def action_cycle_mode(self) -> None:
+        if self.state is SessionState.IDLE and not self._resources_closing:
+            self.mode = Mode((int(self.mode) + 1) % len(Mode))
+            self._has_plan = False
+            self._append_history(notice_block(f"已切换到 {self.mode} 模式"))
+            self._refresh_status()
+
+    def _begin_approval(self, request: ApprovalRequest) -> None:
+        self.pending = request
+        self.approve_cursor = 0
+        self.state = SessionState.APPROVING
+        self._pending_stream_follow = None
+        self._refresh_streaming_view()
+        self.query_one("#streaming-panel", ScrollableContainer).scroll_home(animate=False)
+
+    def _approval_key(self, key: str) -> None:
+        if self.pending is None:
+            return
+        if key in ("up", "k", "down", "j"):
+            self.approve_cursor = (self.approve_cursor + (-1 if key in ("up", "k") else 1)) % 3
+            self._refresh_streaming_view()
+            return
+        choices = (Outcome.ALLOW_ONCE, Outcome.ALLOW_FOREVER, Outcome.DENY_ONCE)
+        if key in ("1", "2", "3"):
+            outcome = choices[int(key) - 1]
+        elif key in ("enter", "space"):
+            outcome = choices[self.approve_cursor]
+        elif key == "y":
+            outcome = Outcome.ALLOW_ONCE
+        elif key in ("n", "d"):
+            outcome = Outcome.DENY_ONCE
+        else:
+            return
+        request = self.pending
+        self.pending = None
+        self.state = SessionState.STREAMING
+        if not request.respond.done():
+            request.respond.set_result(outcome)
+        self._refresh_streaming_view()
 
     async def on_unmount(self) -> None:
         await self._close_resources()

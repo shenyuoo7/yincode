@@ -5,6 +5,9 @@ from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
 
+from yincode.agent import ApprovalRequest
+from yincode.permission import Mode
+
 
 def _visible_text(text: str) -> str:
     """阻止文本控制终端，保留换行、制表符和合法 Unicode。"""
@@ -93,16 +96,41 @@ def _compact_tokens(count: int) -> str:
     return f"{count / 1000000:.1f}m"
 
 
-def status_bar(
-    name: str, model: str, *, plan: bool = False, usage_in: int = 0, usage_out: int = 0
-) -> Table:
+def status_bar(mode: Mode, model: str, *, usage_in: int = 0, usage_out: int = 0) -> Table:
     table = Table.grid(expand=True)
     table.add_column(ratio=1, overflow="ellipsis", no_wrap=True)
     table.add_column(justify="right", overflow="ellipsis", no_wrap=True)
-    provider = Text(_visible_text(name))
-    if plan:
-        provider.append(" PLAN", style="bold yellow")
+    labels = {
+        Mode.DEFAULT: "DEFAULT",
+        Mode.ACCEPT_EDITS: "ACCEPT EDITS",
+        Mode.PLAN: "PLAN",
+        Mode.BYPASS: "BYPASS",
+    }
+    provider = Text(
+        labels[mode],
+        style="bold red"
+        if mode is Mode.BYPASS
+        else "bold yellow"
+        if mode is Mode.PLAN
+        else "green",
+    )
     right = Text(_visible_text(model))
     right.append(f" ↑{_compact_tokens(usage_in)} ↓{_compact_tokens(usage_out)} tok", style="dim")
     table.add_row(provider, right)
     return table
+
+
+def approval_block(request: ApprovalRequest, cursor: int) -> Text:
+    text = Text("● " + _visible_text(request.name) + "\n", style="bold cyan")
+    text.append(
+        "  " + _bounded_text(_visible_text(request.args), max_lines=6, max_bytes=2048) + "\n"
+    )
+    text.append("  " + _visible_text(request.reason) + "\n", style="dim")
+    text.append("是否继续？\n")
+    for index, label in enumerate(("允许本次", "永久允许（写入本地配置）", "拒绝本次")):
+        text.append(
+            f"{'> ' if index == cursor else '  '}{index + 1}. {label}\n",
+            style="bold yellow" if index == cursor else "",
+        )
+    text.append("↑↓ 选择 · 回车确认 · 1/2/3 直选 · Esc 取消", style="dim")
+    return text
