@@ -1,0 +1,17 @@
+# 复制为 permissions.yaml；本地 > 项目 > 用户，同层 deny 优先于 allow。
+# 永久授权写入 permissions.local.yaml，仅留本地，不提交。
+default_mode: default
+permissions:
+  allow:
+    - "Bash(git status)"
+    - "Bash(git diff *)"
+    - "Write(src/**)"
+  deny:
+    - "Bash(git push *)"
+    - "Read(.env)"
+    - "Read(.env.*)"
+    - "Write(.env)"
+    - "Edit(.env)"
+# 文件模式 * 只匹配一个目录段，** 跨目录；路径使用 /。
+# 命令模式 * 可匹配任意字符；反斜杠转义 *、? 和反斜杠自身。
+# 权限黑名单不可关闭。文件工具限制在项目内，shell 不提供完整进程沙箱。

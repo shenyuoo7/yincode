@@ -13,6 +13,7 @@ from typing import Any
 
 from yincode.llm import ToolDefinition
 from yincode.llm._json import object_from_json
+from yincode.permission.sandbox import contained
 
 from . import Result, Tool
 
@@ -25,7 +26,8 @@ READ_LINES = 2000
 class Registry:
     """保留注册顺序；超时等待工具完成取消清理后返回。"""
 
-    def __init__(self) -> None:
+    def __init__(self, cwd: Path | str | None = None) -> None:
+        self.cwd = Path(cwd if cwd is not None else Path.cwd()).resolve()
         self._tools: dict[str, Tool] = {}
 
     def register(self, tool: Tool) -> None:
@@ -47,13 +49,13 @@ class Registry:
         return [
             ToolDefinition(tool.name, tool.description, deepcopy(tool.parameters))
             for tool in self._tools.values()
-            if tool.read_only
+            if getattr(tool, "read_only", False) is True
         ]
 
     def is_read_only(self, name: str) -> bool:
         """未知工具按有副作用处理。"""
         tool = self.get(name)
-        return tool is not None and tool.read_only
+        return tool is not None and getattr(tool, "read_only", False) is True
 
     async def execute(
         self,
@@ -86,7 +88,7 @@ def new_default_registry(cwd: Path | str | None = None) -> Registry:
     from .write_file import WriteFileTool
 
     directory = Path(cwd if cwd is not None else Path.cwd()).resolve()
-    registry = Registry()
+    registry = Registry(cwd=directory)
     for tool_type in [ReadFileTool, WriteFileTool, EditFileTool, BashTool, GlobTool, GrepTool]:
         registry.register(tool_type(cwd=directory))
     return registry
@@ -213,15 +215,21 @@ class _FileTool:
         raise NotImplementedError
 
 
-def _files(root: Path, stopped: Event) -> Iterator[Path]:
+def _files(root: Path, stopped: Event, *, boundary: Path | None = None) -> Iterator[Path]:
     """流式深度优先遍历，不缓存整目录，不跟随目录链接。"""
+    boundary = boundary if boundary is not None else root.resolve()
     with os.scandir(root) as entries:
         for entry in entries:
             if stopped.is_set():
                 return
             try:
+                path = Path(entry.path)
+                if path.is_junction() or (entry.is_symlink() and entry.is_dir()):
+                    continue
+                if not contained(str(boundary), str(path)):
+                    continue
                 if entry.is_dir(follow_symlinks=False):
-                    yield from _files(Path(entry.path), stopped)
+                    yield from _files(path, stopped, boundary=boundary)
                 elif entry.is_file():
                     yield Path(entry.path)
             except OSError:

@@ -7,6 +7,8 @@ from multiprocessing.connection import Connection
 from threading import Event
 from typing import Any
 
+from yincode.permission.sandbox import contained
+
 from . import Result
 from .glob_tool import _matches
 from .registry import OUTPUT_BYTES, _files, _FileTool, _string, _truncate, _utf8_prefix
@@ -103,6 +105,9 @@ class GrepTool(_FileTool):
         truncated = False
         incomplete = False
         for path in paths:
+            # 搜索根检查不能替代逐文件检查；目录内链接可能指向根外。
+            if not contained(str(root if root.is_dir() else root.parent), str(path)):
+                continue
             label = path.name if root.is_file() else path.relative_to(root).as_posix()
             if not _matches(label, pattern):
                 continue

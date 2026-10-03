@@ -3,9 +3,10 @@
 import bisect
 import fnmatch
 import os
-from pathlib import Path
 from threading import Event
 from typing import Any
+
+from yincode.permission.settings import valid_search_pattern
 
 from . import Result
 from .registry import OUTPUT_BYTES, _files, _FileTool, _string, _truncate
@@ -46,8 +47,8 @@ class GlobTool(_FileTool):
     def _execute(self, data: dict[str, Any], stopped: Event) -> Result:
         root = self._path(_string(data, "path", default="."))
         pattern = _string(data, "pattern")
-        if Path(pattern).is_absolute():
-            raise ValueError("pattern 必须是相对模式；请用 path 指定搜索目录")
+        if not valid_search_pattern(pattern):
+            raise ValueError("pattern 必须是相对模式且不能含 ..；请用 path 指定搜索目录")
         selected: list[str] = []
         count = 0
         for path in _files(root, stopped):

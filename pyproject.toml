@@ -31,6 +31,7 @@ include = [
   ".gitignore",
   ".gitattributes",
   ".yincode/config.yaml.example",
+  ".yincode/permissions.yaml.example",
 ]
 
 [dependency-groups]
