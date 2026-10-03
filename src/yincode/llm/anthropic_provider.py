@@ -39,19 +39,12 @@ def build_anthropic_system(system: System) -> list[TextBlockParam]:
 
 
 def _append_reminder_anthropic(messages: list[MessageParam], reminder: str) -> list[MessageParam]:
-    """在独立请求副本末尾追加提醒，保留工具结果在文本之前。"""
+    """提醒独立成消息；保留前面的用户输入和工具结果，不修改历史。"""
     copied = deepcopy(messages)
     if not reminder:
         return copied
     block: TextBlockParam = {"type": "text", "text": reminder}
-    if copied and copied[-1]["role"] == "user":
-        content = copied[-1]["content"]
-        if isinstance(content, str):
-            copied[-1]["content"] = [{"type": "text", "text": content}, block]
-        else:
-            copied[-1]["content"] = [*content, block]
-    else:
-        copied.append({"role": "user", "content": [block]})
+    copied.append({"role": "user", "content": [block]})
     return copied
 
 

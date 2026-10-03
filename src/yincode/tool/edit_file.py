@@ -13,6 +13,7 @@ class EditFileTool(_FileTool):
     _description = (
         "以 new_string 替换文件中唯一匹配的非空 old_string；匹配数不等于 1 则拒绝。"
         "编辑前请先用 read_file 读取目标文件，确认 old_string 唯一。"
+        "修改现有文件优先用本工具做最小替换，保留无关代码，不用 bash 拼凑编辑命令。"
     )
     _parameters = {
         "type": "object",

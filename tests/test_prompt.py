@@ -57,11 +57,20 @@ def test_stable_prompt_has_seven_modules_three_empty_slots_and_tool_rules():
     assert all(m.content == "" for m in optional_modules())
     stable = build_system_prompt()
     assert stable == build_system_prompt()
-    assert stable.startswith("You are yincode")
+    assert [m.name for m in fixed] == [
+        "identity",
+        "behavior",
+        "tool_use",
+        "code_quality",
+        "security",
+        "task_mode",
+        "output",
+    ]
+    assert stable.startswith("## 角色设定\n你是 yincode")
     assert stable.count("\n\n") == 6
     assert "read_file" in stable and "glob" in stable and "grep" in stable
-    assert "before editing" in stable.lower()
-    assert "prefer" in stable.lower()
+    assert "编辑前" in stable
+    assert "优先" in stable
     for dynamic in [str(date.today()), str(os.getcwd()), sys.platform, "PowerShell"]:
         assert dynamic not in stable
 
@@ -92,12 +101,12 @@ def test_reminders_are_temporary_context_not_user_questions_or_trust_elevation()
     for text in [full, concise]:
         assert text.startswith("<system-reminder>\n")
         assert text.endswith("\n</system-reminder>")
-        assert "read-only" in text
+        assert "只读" in text
         assert "/do" in text
-        assert "not a user question" in text
-        assert "file or tool output" in text
-    assert "plan" in full and "step" in full
-    assert "Execute" in EXECUTE_DIRECTIVE
+        assert "不是用户提问" in text
+        assert "文件或工具输出" in text
+    assert "计划" in full and "验证" in full
+    assert "执行" in EXECUTE_DIRECTIVE
     assert system_reminder("context") == "<system-reminder>\ncontext\n</system-reminder>"
 
 

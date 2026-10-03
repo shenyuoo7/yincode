@@ -171,6 +171,8 @@ class BashTool(_FileTool):
         )
         self._description += (
             "读文件、找文件、搜内容请优先用 read_file/glob/grep，不要用 bash 拼凑。"
+            "文件写入与编辑用 write_file/edit_file。命令执行后检查退出码，"
+            "破坏性操作须有明确授权；只支持 command 参数。"
         )
 
     def _argv(self, command: str) -> list[str]:

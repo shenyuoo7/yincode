@@ -1290,15 +1290,18 @@ async def test_reminder_is_sent_after_tool_results_without_mutating_request(
         assert [event async for event in provider.stream(req)][-1] == StreamEvent(done=True)
         messages = json.loads(requests[0].content)["messages"]
         if protocol == "anthropic":
-            assert messages[-1]["content"] == [
+            assert messages[-2]["content"] == [
                 {
                     "type": "tool_result",
                     "tool_use_id": "call-a",
                     "content": "结果",
                     "is_error": False,
                 },
-                {"type": "text", "text": "临时提醒"},
             ]
+            assert messages[-1] == {
+                "role": "user",
+                "content": [{"type": "text", "text": "临时提醒"}],
+            }
         else:
             assert messages[-2:] == [
                 {"role": "tool", "tool_call_id": "call-a", "content": "结果"},

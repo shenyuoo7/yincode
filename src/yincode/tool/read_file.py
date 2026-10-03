@@ -10,7 +10,11 @@ from .registry import READ_BYTES, READ_LINES, _FileTool, _string, _truncate, _ut
 class ReadFileTool(_FileTool):
     _name = "read_file"
     read_only = True
-    _description = "读取 UTF-8 文件并返回行号；最多 2000 行和 256 KiB，超出标注截断。"
+    _description = (
+        "读取 UTF-8 文件并返回行号；最多 2000 行和 256 KiB，超出标注截断。"
+        "优先用本工具读取文件，编辑前先读取确认原文；截断结果不是完整文件。"
+        "path 可为绝对路径或相对于会话工作目录的路径，不支持 offset/limit 参数。"
+    )
     _parameters = {
         "type": "object",
         "properties": {"path": {"type": "string", "description": "要读取的文件路径"}},

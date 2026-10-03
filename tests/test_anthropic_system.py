@@ -51,20 +51,19 @@ def test_reminder_request_keeps_original_nested_history(role: str) -> None:
     old_messages = deepcopy(messages)
     new_messages = _append_reminder_anthropic(messages, req.reminder)
     assert messages == old_messages
+    assert new_messages[:-1] == old_messages
+    assert len(new_messages) == len(messages) + 1
     assert new_messages[-1]["role"] == "user"
     assert new_messages[-1]["content"][-1] == {"type": "text", "text": "临时提醒"}
     if role == "tool":
-        assert new_messages[-1]["content"][0] == {
+        assert new_messages[-2]["content"][0] == {
             "type": "tool_result",
             "tool_use_id": "call-a",
             "content": "内容",
             "is_error": True,
         }
-        assert len(new_messages) == len(messages)
     elif role == "user":
-        assert new_messages[-1]["content"][0] == {"type": "text", "text": "任务"}
-    else:
-        assert len(new_messages) == len(messages) + 1
+        assert new_messages[-2] == {"role": "user", "content": "任务"}
     openai_messages = _to_openai_messages(req)
     assert openai_messages[0] == {"role": "system", "content": "稳定\n\n环境"}
     assert openai_messages[-1] == {"role": "user", "content": "临时提醒"}
